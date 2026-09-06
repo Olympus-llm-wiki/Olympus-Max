@@ -1,0 +1,10 @@
+{"ordinal":0,"timestamp":"2026-09-05T10:00:00Z","type":"session_meta","payload":{"id":"synthetic-thread","cli_version":"0.153.1"}}
+{"ordinal":1,"timestamp":"2026-09-05T10:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"synthetic-turn"}}
+{"ordinal":2,"timestamp":"2026-09-05T10:00:01Z","type":"world_state","payload":{"SYNTHETIC_PRIVATE_WORLD_STATE":"never inspect or export"}}
+{"ordinal":3,"timestamp":"2026-09-05T10:00:02Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"Синтетическая задача."}],"internal_chat_message_metadata_passthrough":{"turn_id":"synthetic-turn","content_item_kinds":["user.text"],"create_time":1788602402.0}}}
+{"ordinal":4,"timestamp":"2026-09-05T10:00:03Z","type":"response_item","payload":{"type":"agent_message","author":"synthetic-child","recipient":"synthetic-parent","id":"synthetic-agent-message","content":[{"type":"input_text","text":"Синтетический отчёт подагента."},{"type":"encrypted_content","encrypted_content":"SYNTHETIC_ENCRYPTED_AGENT_CONTEXT"}],"internal_chat_message_metadata_passthrough":{"turn_id":"synthetic-turn","create_time":1788602403.0}}}
+{"ordinal":5,"timestamp":"2026-09-05T10:00:04Z","type":"token_usage_record","payload":{"synthetic":true}}
+{"ordinal":6,"timestamp":"2026-09-05T10:00:04Z","type":"inter_agent_communication_metadata","payload":{"synthetic":true}}
+{"ordinal":7,"timestamp":"2026-09-05T10:00:04Z","type":"event_msg","payload":{"type":"thread_settings_applied"}}
+{"ordinal":8,"timestamp":"2026-09-05T10:00:05Z","type":"response_item","payload":{"type":"message","role":"assistant","phase":"final_answer","content":[{"type":"output_text","text":"Синтетический результат."}],"internal_chat_message_metadata_passthrough":{"turn_id":"synthetic-turn","content_item_kinds":["unknown"]}}}
+{"ordinal":9,"timestamp":"2026-09-05T10:00:06Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"synthetic-turn"}}

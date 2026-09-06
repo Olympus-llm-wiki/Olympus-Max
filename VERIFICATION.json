@@ -1,0 +1,15 @@
+{
+  "schema": 1,
+  "starter": "Olympus-Max",
+  "tests_passed": 288,
+  "tests_failed": 0,
+  "private_paths_or_ids": 0,
+  "personal_corpus_included": false,
+  "credentials_included": false,
+  "source_only_template": true,
+  "checks": {
+    "live_hindsight_read_only": true,
+    "live_model_access": "not_tested",
+    "synthetic_file_workflow": false
+  }
+}

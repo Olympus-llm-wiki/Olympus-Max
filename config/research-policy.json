@@ -1,0 +1,6 @@
+{
+  "schema": 1,
+  "require_source_dates": false,
+  "min_distinct_originals": 1,
+  "allow_whitespace_normalization": true
+}

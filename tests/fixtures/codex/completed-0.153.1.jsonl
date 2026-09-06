@@ -1,0 +1,16 @@
+{"timestamp":"2026-09-05T10:00:00Z","type":"session_meta","payload":{"id":"synthetic-thread","cli_version":"0.153.1","cwd":"/synthetic/project"}}
+{"timestamp":"2026-09-05T10:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"synthetic-turn"}}
+{"timestamp":"2026-09-05T10:00:01Z","type":"turn_context","payload":{"turn_id":"synthetic-turn"}}
+{"timestamp":"2026-09-05T10:00:02Z","type":"response_item","payload":{"type":"message","role":"developer","content":[{"type":"input_text","text":"SYNTHETIC_INTERNAL_INSTRUCTIONS"}]}}
+{"timestamp":"2026-09-05T10:00:02Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"# AGENTS.md instructions for /synthetic/project\nSYNTHETIC_STARTUP"}]}}
+{"timestamp":"2026-09-05T10:00:03Z","type":"event_msg","payload":{"type":"user_message","message":"Проверь цвет: красный."}}
+{"timestamp":"2026-09-05T10:00:03Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"Проверь цвет: красный."}]}}
+{"timestamp":"2026-09-05T10:00:04Z","type":"response_item","payload":{"type":"reasoning","summary":[{"type":"summary_text","text":"SYNTHETIC_PRIVATE_REASONING"}],"encrypted_content":"SYNTHETIC_ENCRYPTED"}}
+{"timestamp":"2026-09-05T10:00:05Z","type":"response_item","payload":{"type":"message","role":"assistant","phase":"commentary","content":[{"type":"output_text","text":"Проверяю сохранённый файл."}]}}
+{"timestamp":"2026-09-05T10:00:06Z","type":"response_item","payload":{"type":"function_call","name":"read_file","call_id":"synthetic-call","arguments":"{\"path\":\"/synthetic/color.txt\"}"}}
+{"timestamp":"2026-09-05T10:00:07Z","type":"response_item","payload":{"type":"function_call_output","call_id":"synthetic-call","output":"color=red\nrevision=synthetic-42"}}
+{"timestamp":"2026-09-05T10:00:08Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"Поправка: нужен синий, прежний выбор отменён."}]}}
+{"timestamp":"2026-09-05T10:00:09Z","type":"response_item","payload":{"type":"message","role":"assistant","phase":"final_answer","content":[{"type":"output_text","text":"Актуальный выбор — синий."}]}}
+{"timestamp":"2026-09-05T10:00:09Z","type":"event_msg","payload":{"type":"agent_message","message":"Актуальный выбор — синий."}}
+{"timestamp":"2026-09-05T10:00:10Z","type":"event_msg","payload":{"type":"token_count","info":{"synthetic":true}}}
+{"timestamp":"2026-09-05T10:00:10Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"synthetic-turn"}}

@@ -1,0 +1,16 @@
+[project]
+name = "olympus-max-starter"
+version = "0.1.0"
+description = "Durable personal memory starter backed by Hindsight"
+requires-python = ">=3.12"
+dependencies = []
+
+[project.scripts]
+olympus-max = "olympus.starter:main"
+
+[build-system]
+requires = ["hatchling==1.27.0"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/olympus"]

@@ -122,7 +122,7 @@
     "scripts/generate-capture-hooks.py": "c82cf6caaef2bd150f853b684ca42aafd4329757ed574fd44e855cb334b07ec8",
     "scripts/receive-remote-file.py": "e427801e2cc43a9f923f4b688d5880852fd85f234579a5940dfa5c3968385635",
     "scripts/verify-distribution.py": "8ba0d73d57e65c3de39f811277c051c0836f63202363f0a1a89beae3ef585fbc",
-    "src/olympus/__init__.py": "1be6086be1c8cb169e0a0ab54ca3b8ce3afcdad993021d57e2906548b2233e83",
+    "src/olympus/__init__.py": "586ee0e3f713f4de7e8c0d3fffdcb02d722b8fc6123188c1c82fd023caa96bed",
     "src/olympus/__main__.py": "935a1c1166b0c1ea35a82256345000bf2c73ded718d77773bc27a71ecce28f7d",
     "src/olympus/backup.py": "f347f1b283861134327694bb8fdb3ca5a6fa25ffdf895001968abb1ec7b48585",
     "src/olympus/backup_job.py": "fdbb6f016e8980e61e4a23693c90db9c130d91b5804467f7965ea9b13c668904",

@@ -11,7 +11,7 @@ from .preservation import Store, PreservationError, canonical, guard_no_secrets
 
 PROJECT = Path(__file__).resolve().parents[2]
 PROFILE = PROJECT / "starter.local.json"
-SUPPORTED = {"capture-file", "capture-url", "status", "receipt", "recall", "grant-budget",
+SUPPORTED = {"capture-file", "capture-url", "status", "receipt", "recall", "search", "grant-budget",
              "pause-models", "work", "research", "learning", "retry", "sync-tasks", "register-task"}
 
 

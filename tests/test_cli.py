@@ -39,6 +39,17 @@ class CLITests(unittest.TestCase):
         p = self.run_cli("status")
         self.assertEqual(json.loads(p.stdout)["versions"], 1)
 
+    def test_search_local_default_and_explicit_scope(self):
+        store = Store(self.state)
+        for scope in ('ugc', 'other'):
+            store.capture(source_key=scope, scope=scope, title='Identity LoRA',
+                          original=b'lora training dataset', text='lora training dataset')
+        p = self.run_cli('search', 'лора', '--local-only')
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertEqual(len(json.loads(p.stdout)['results']), 2)
+        p = self.run_cli('search', 'лора', '--local-only', '--scope', 'ugc')
+        self.assertEqual(len(json.loads(p.stdout)['results']), 1)
+
     def test_no_implicit_model_budget(self):
         p = self.run_cli("status")
         self.assertEqual(json.loads(p.stdout)["budget"]["remaining"], 0)

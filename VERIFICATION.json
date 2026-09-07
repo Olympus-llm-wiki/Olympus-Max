@@ -1,15 +1,70 @@
 {
   "schema": 1,
   "starter": "Olympus-Max",
-  "tests_passed": 288,
+  "distribution_version": "0.2.0",
+  "verified_at": "2026-09-07",
+  "tests_passed": 332,
   "tests_failed": 0,
   "private_paths_or_ids": 0,
   "personal_corpus_included": false,
   "credentials_included": false,
   "source_only_template": true,
   "checks": {
-    "live_hindsight_read_only": true,
+    "live_hindsight_read_only": "not_repeated_in_this_release",
     "live_model_access": "not_tested",
-    "synthetic_file_workflow": false
+    "synthetic_media_regressions": 24,
+    "distribution_verifier_tests": 5,
+    "local_search_profile_and_outage": true,
+    "skill_upstream_hashes": 25,
+    "skill_frontmatter": {
+      "valid_required_fields": 26,
+      "preserved_claude_extensions": {
+        "wayfinder": [
+          "disable-model-invocation"
+        ],
+        "setup-matt-pocock-skills": [
+          "disable-model-invocation"
+        ],
+        "wait-what": [
+          "disable-model-invocation"
+        ],
+        "handoff": [
+          "argument-hint",
+          "disable-model-invocation"
+        ],
+        "to-tickets": [
+          "disable-model-invocation"
+        ],
+        "ask-matt": [
+          "disable-model-invocation"
+        ],
+        "improve-codebase-architecture": [
+          "disable-model-invocation"
+        ],
+        "to-questionnaire": [
+          "disable-model-invocation"
+        ],
+        "to-spec": [
+          "disable-model-invocation"
+        ],
+        "triage": [
+          "disable-model-invocation"
+        ],
+        "grill-with-docs": [
+          "disable-model-invocation"
+        ],
+        "implement": [
+          "disable-model-invocation"
+        ],
+        "teach": [
+          "argument-hint",
+          "disable-model-invocation"
+        ],
+        "grill-me": [
+          "disable-model-invocation"
+        ]
+      },
+      "strict_codex_validator": "passes media skill; rejects known Claude extension keys in 14 unmodified upstream skills"
+    }
   }
 }

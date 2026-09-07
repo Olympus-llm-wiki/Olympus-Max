@@ -112,6 +112,14 @@ def parser():
         sub.add_parser(name)
     receipt = sub.add_parser("receipt")
     receipt.add_argument("version_id")
+    search = sub.add_parser("search", help="Поиск по каталогу и зарегистрированному корпусу")
+    search.add_argument("query")
+    search.add_argument("--scope", action="append", help="Явно ограничить область; можно повторить")
+    search.add_argument("--package", help="Явно ограничить зарегистрированным пакетом")
+    search.add_argument("--local-only", action="store_true", help="Без запроса Hindsight")
+    search.add_argument("--include-discussions", action="store_true")
+    search.add_argument("--limit", type=int, default=20)
+    search.add_argument("--timeout", type=float, default=30)
     query = sub.add_parser("recall")
     query.add_argument("query")
     query.add_argument("--scope", required=True)
@@ -237,6 +245,12 @@ def main(argv=None) -> int:
             with store.exclusive():
                 store.set_setting("budget_expires", "0")
             result = {"new_submissions_paused": True, "already_submitted_jobs_cancelled": False}
+        elif args.command == "search":
+            from .search import search_corpus
+            result = search_corpus(store, args.query,
+                                   client=None if args.local_only else _client(args, timeout=args.timeout),
+                                   scopes=args.scope, package_id=args.package,
+                                   include_discussions=args.include_discussions, limit=args.limit)
         elif args.command == "recall":
             guard_no_secrets(args.query.encode())
             result = recall_active(store, _client(args, timeout=args.timeout), args.query, args.scope,

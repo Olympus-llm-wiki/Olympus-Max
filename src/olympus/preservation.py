@@ -269,7 +269,7 @@ class Store:
         self._register(saved, locator=locator)
         return self.receipt(version_id)
 
-    def read_version(self, version_id: str) -> dict:
+    def read_manifest(self, version_id: str) -> dict:
         if not re.fullmatch(r"olv-[a-f0-9]{64}", version_id):
             raise PreservationError("invalid_version_id")
         folder = self.versions / version_id
@@ -289,6 +289,16 @@ class Store:
                 stored_anchor = db.execute("SELECT sha256 FROM manifest_integrity WHERE version_id=?", (version_id,)).fetchone()
                 if stored_anchor and stored_anchor[0] != actual_manifest_hash:
                     raise PreservationError("source_manifest_hash_mismatch")
+            if not isinstance(m, dict) or m.get("version_id") != version_id or m.get("schema") != 1:
+                raise PreservationError("source_manifest_mismatch")
+            return m
+        except (OSError, ValueError, KeyError, TypeError):
+            raise PreservationError("invalid_source_version") from None
+
+    def read_version(self, version_id: str) -> dict:
+        m = self.read_manifest(version_id)
+        folder = self.versions / version_id
+        try:
             original = (folder / "original").read_bytes()
             text_bytes = (folder / "text.txt").read_bytes()
             semantic = {k: m[k] for k in ("source_key", "scope", "kind", "title", "metadata")}

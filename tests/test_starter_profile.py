@@ -6,7 +6,9 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
+from contextlib import redirect_stdout
 from olympus import starter
+from olympus.hindsight import HindsightError
 from olympus.preservation import Store, PreservationError
 
 
@@ -55,6 +57,35 @@ class StarterProfileTests(unittest.TestCase):
         starter.setup_main(["setup", "--state", str(self.state)])
         with patch("olympus.cli.main", side_effect=AssertionError("not delegated")):
             self.assertEqual(starter.main(["reconcile"]), 2)
+
+    def test_local_search_uses_profile_without_network_or_api_key(self):
+        starter.setup_main(["setup", "--state", str(self.state)])
+        store = Store(self.state)
+        captured = store.capture(source_key="synthetic", scope="personal", title="Orchid plan",
+            text="Orchid plans stay local", original=b"Orchid plans stay local", metadata={"material_role": "primary"})
+        output = io.StringIO()
+        with patch.dict(os.environ, {"OLYMPUS_STATE_DIR": "/unrelated", "OLYMPUS_HINDSIGHT_API_KEY": ""}), \
+             patch("socket.create_connection", side_effect=AssertionError("network forbidden")), redirect_stdout(output):
+            self.assertEqual(starter.main(["search", "orchid", "--local-only"]), 0)
+        result = json.loads(output.getvalue())
+        self.assertEqual(result["results"][0]["version_id"], captured.version_id)
+        self.assertEqual(result["results"][0]["delivery_state"], "pending")
+        self.assertEqual(result["coverage"]["catalog"], "unavailable")
+        self.assertFalse(result["coverage"]["absence_proven"])
+
+    def test_search_keeps_local_result_when_hindsight_fails(self):
+        starter.setup_main(["setup", "--state", str(self.state)])
+        store = Store(self.state)
+        captured = store.capture(source_key="synthetic", scope="personal", title="Orchid plan",
+            text="Orchid plans stay local", original=b"Orchid plans stay local", metadata={"material_role": "primary"})
+        store.update_delivery(store.claim(), "searchable", units=1)
+        output = io.StringIO()
+        with patch.dict(os.environ, {}), \
+             patch.object(starter.HindsightClient, "recall", side_effect=HindsightError("network_error")), redirect_stdout(output):
+            self.assertEqual(starter.main(["search", "orchid"]), 0)
+        result = json.loads(output.getvalue())
+        self.assertEqual(result["results"][0]["version_id"], captured.version_id)
+        self.assertEqual(result["coverage"]["semantic"][0]["state"], "unavailable")
 
     def test_live_doctor_uses_authenticated_bank_endpoint(self):
         starter.setup_main(["setup", "--state", str(self.state)])

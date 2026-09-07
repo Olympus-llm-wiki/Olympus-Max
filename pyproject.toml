@@ -1,6 +1,6 @@
 [project]
 name = "olympus-max-starter"
-version = "0.1.0"
+version = "0.2.0"
 description = "Durable personal memory starter backed by Hindsight"
 requires-python = ">=3.12"
 dependencies = []

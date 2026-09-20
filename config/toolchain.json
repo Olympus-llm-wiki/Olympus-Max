@@ -11,5 +11,5 @@
     "language_server_route": "Pinned npm pyright with native ls_base_cmd; no uvx interpreter/package auto-download"
   },
   "checked_at": "2026-09-20",
-  "source_revision": "55540f7f779ebfcbb468943df19f1880dd6d79ed"
+  "source_revision": "833ac65b2a8158920a14680d7a110589a16229a9"
 }

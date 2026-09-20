@@ -5,12 +5,12 @@
   "platform": "macOS Apple Silicon",
   "python": "3.12.13",
   "tests": {
-    "run": 587,
+    "run": 588,
     "skipped": 0
   },
   "skip_reason": null,
   "media_package_tests": 88,
-  "portable_installer_tests": 10,
+  "portable_installer_tests": 11,
   "clean_archive_setup": true,
   "serena_mcp": {
     "tools": 14,

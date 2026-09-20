@@ -180,7 +180,11 @@ def install(root, *, core_only=False, port=None):
     if not brew: raise EnvironmentError('homebrew_missing_run_Install.command')
     needed={'uv':'uv','node@24':'node','git':'git','ripgrep':'rg','tmux':'tmux','ffmpeg':'ffmpeg','gh':'gh','yt-dlp':'yt-dlp'}
     for formula,binary in needed.items():
-        if not shutil.which(binary,path=tool_env()['PATH']): command([brew,'install',formula])
+        missing=not shutil.which(binary,path=tool_env()['PATH'])
+        if formula=='node@24' and not missing:
+            try: missing=int(command(['node','--version'],capture=True,timeout=10).lstrip('v').split('.')[0])<24
+            except (EnvironmentError,ValueError): missing=True
+        if missing: command([brew,'install',formula])
     if not core_only:
         for cask in plan['casks']:
             binary={'codex':'codex','claude-code':'claude','docker-desktop':'docker'}[cask]
@@ -222,8 +226,9 @@ def install(root, *, core_only=False, port=None):
             runtime(root,'prepare')
             if os.environ.get('OLYMPUS_HINDSIGHT_API_KEY'): runtime(root,'start')
             else: print('Docker подготовлен. Для запуска доставьте OLYMPUS_HINDSIGHT_API_KEY из менеджера секретов.',flush=True)
-    print(json.dumps(doctor(root),ensure_ascii=False,indent=2))
-    return 0
+    report=doctor(root)
+    print(json.dumps(report,ensure_ascii=False,indent=2))
+    return 0 if report['tools_ready'] else 2
 
 def tool_command(root,cfg,name,args):
     base=Path(cfg['state'])

@@ -31,6 +31,16 @@ class EnvironmentTests(unittest.TestCase):
         with self.assertRaisesRegex(self.m.EnvironmentError, 'macos_apple_silicon_required'):
             self.m.install_plan(self.root, system='Linux', machine='x86_64')
 
+    def test_installer_updates_an_unsupported_existing_node(self):
+        class StopBeforeConfiguration(Exception): pass
+        calls=[]
+        def run(argv,**kwargs):
+            calls.append(argv)
+            return 'v18.20.0' if argv==['node','--version'] else ''
+        with patch.object(self.m,'verify'), patch.object(self.m.shutil,'which',return_value='/opt/homebrew/bin/brew'), patch.object(self.m,'command',side_effect=run), patch.object(self.m,'configure',side_effect=StopBeforeConfiguration):
+            with self.assertRaises(StopBeforeConfiguration): self.m.install(self.root,core_only=True)
+        self.assertIn(['/opt/homebrew/bin/brew','install','node@24'],calls)
+
     def test_max_plan_adds_docker(self):
         (self.root / 'TEMPLATE.json').write_text(json.dumps({'edition':'Olympus-Max'}))
         self.assertIn('docker-desktop', str(self.m.install_plan(self.root, system='Darwin', machine='arm64')))

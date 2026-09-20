@@ -1,0 +1,4 @@
+interface:
+  display_name: "ХОВС"
+  short_description: "Подбор NED в Excel и PDF с источниками"
+  default_prompt: "Используй $khvs для обработки подбора NED и шаблона ХОВС."

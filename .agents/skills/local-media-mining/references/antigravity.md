@@ -61,4 +61,5 @@ status=ERROR сохраняет raw и предварительный result, н
 [custom agents](https://antigravity.google/docs/subagents),
 [hooks](https://antigravity.google/docs/hooks),
 [credits](https://antigravity.google/docs/cli/credits/).
-Происхождение runner и ограничения переноса: [документация медиа](../../../../docs/media.md). Документация поставщика не доказывает качество конкретного запуска.
+Пилот и его первичные квитанции: docs/research/antigravity-media-pilot-2026-09-07.md
+в текущем Olympus. Документация поставщика не доказывает качество конкретного запуска.

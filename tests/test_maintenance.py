@@ -150,6 +150,41 @@ class MaintenanceTests(unittest.TestCase):
         with self.assertRaisesRegex(PreservationError, "source_is_forgotten"):
             self.capture("old", "Late old text")
 
+    def test_reconciliation_covers_all_representation_generations_and_child_operations(self):
+        from olympus.representations import Representations
+        reps = Representations(self.store)
+        profile = {"mode": "concise", "strategy": None, "config_fingerprint": "a" * 64, "execution_profile_known": True}
+        plans = [reps.prepare(self.old.version_id, profile=profile, max_part_chars=5, generation=g)
+                 for g in ("initial", "refresh-1")]
+        target_documents = {self.old.version_id}
+        for plan in plans:
+            for part in plan["parts"]:
+                target_documents.add(part["document_id"])
+                self.client.documents.add(part["document_id"])
+                self.client.add_operation(identifier=part["operation_id"], document_id=part["document_id"], status="pending", task_type="batch_retain")
+                self.client.add_operation(document_id=part["document_id"], status="completed", task_type="retain")
+        original = self.store.read_version(self.old.version_id)["original"]
+        self.forget()
+        result = self.run_reconciliation()
+        self.assertEqual(result["state"], "reconciled", result)
+        self.assertEqual(set(result["target_document_ids"]), target_documents)
+        self.assertFalse(target_documents & self.client.documents)
+        self.assertFalse(any(row["document_id"] in target_documents for row in self.client.ops.values()))
+        self.assertIn(self.other.version_id, self.client.documents)
+        self.assertIn(self.other.operation_id, self.client.ops)
+        self.assertEqual(self.store.read_version(self.old.version_id)["original"], original)
+
+    def test_corrupt_representation_manifest_does_not_delete_any_native_document(self):
+        from olympus.representations import Representations
+        reps = Representations(self.store)
+        plan = reps.prepare(self.old.version_id, profile={"mode": "concise", "execution_profile_known": True}, max_part_chars=5)
+        with self.store.connect(write=True) as db:
+            db.execute("UPDATE native_representations SET manifest_json='{}' WHERE id=?", (plan["id"],))
+        self.forget()
+        result = self.run_reconciliation()
+        self.assertEqual(result["state"], "blocked")
+        self.assertEqual(self.writes(), [])
+
     def test_replacement_searchability_is_a_separate_receipt(self):
         new = self.capture("old", "Synthetic replacement")
         self.client.documents.add(new.version_id)

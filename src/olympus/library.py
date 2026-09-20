@@ -15,10 +15,12 @@ import re
 import shutil
 import stat
 import tempfile
-from typing import Iterator, Sequence
+import time
+from typing import Callable, Iterator, Sequence
 import uuid
 
-from .preservation import Store, PreservationError, canonical, digest, guard_no_secrets
+from .preservation import Store, PreservationError, canonical, digest, guard_no_secrets, _SECRET_PATTERNS
+from .bounded_io import fingerprint, hash_file, read_file, guard_file, scan_guard_file, copy_window, publish_file
 
 _SELECTABLE = frozenset({"Inbox", "Library/Personal"})
 _TEXT_EXTENSIONS = frozenset({".md", ".markdown", ".txt", ".text"})
@@ -80,19 +82,16 @@ def _same_file(path: Path, expected: bytes) -> bool:
     if path.is_symlink():
         raise PreservationError("library_file_symlink")
     try:
-        fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK | getattr(os, "O_NOFOLLOW", 0))
+        info = fingerprint(path)
     except FileNotFoundError:
         return False
-    with os.fdopen(fd, "rb") as stream:
-        info = os.fstat(stream.fileno())
-        if not stat.S_ISREG(info.st_mode):
-            raise PreservationError("library_file_not_regular")
-        if info.st_size != len(expected) or stream.read(len(expected) + 1) != expected:
-            raise PreservationError("library_existing_bytes_conflict")
+    if info["bytes"] != len(expected) or hash_file(path, max_bytes=len(expected)) != digest(expected):
+        raise PreservationError("library_existing_bytes_conflict")
     return True
 
 
-def _publish_files(directory: Path, files: dict[str, bytes], *, strict: bool) -> bool:
+def _publish_files(directory: Path, files: dict[str, bytes], *, strict: bool,
+                   allowed_aliases: dict[str, dict] | None = None, fence=None) -> bool:
     """Publish complete files by hardlink, manifest last; never clobber a name.
 
     A crash can leave a subset of complete files. The next call compares every
@@ -104,12 +103,14 @@ def _publish_files(directory: Path, files: dict[str, bytes], *, strict: bool) ->
     directory.mkdir(exist_ok=True, mode=0o700)
     if not directory.is_dir():
         raise PreservationError("library_directory_conflict")
-    if strict and set(p.name for p in directory.iterdir()) - set(files) - {".DS_Store"}:
-        raise PreservationError("library_unexpected_version_files")
+    if strict:
+        _check_inventory(directory, set(files), allowed_aliases or {})
     existing = [_same_file(directory / name, data) for name, data in files.items()]
     existed = all(existing)
     if existed:
         return False
+    if fence:
+        fence()
     stage = Path(tempfile.mkdtemp(prefix=".olympus-export-", dir=directory.parent))
     try:
         for name, data in files.items():
@@ -124,6 +125,8 @@ def _publish_files(directory: Path, files: dict[str, bytes], *, strict: bool) ->
             target = directory / name
             if _same_file(target, data):
                 continue
+            if fence:
+                fence()
             try:
                 os.link(stage / name, target, follow_symlinks=False)
             except FileExistsError:
@@ -137,6 +140,51 @@ def _publish_files(directory: Path, files: dict[str, bytes], *, strict: bool) ->
     finally:
         shutil.rmtree(stage)
     return True
+
+
+def _check_inventory(directory: Path, names: set[str], aliases: dict[str, dict]) -> None:
+    if directory.is_symlink():
+        raise PreservationError("library_directory_symlink")
+    extras = set(p.name for p in directory.iterdir()) - names - {".DS_Store"}
+    if extras - set(aliases):
+        raise PreservationError("library_unexpected_version_files")
+    for name in extras:
+        pending = aliases[name].get("verification") == "pending"
+        observed = fingerprint(directory / name, allow_dataless=pending)
+        # Explicit pending aliases are excluded from canonical proof. They remain
+        # visible warnings; no unknown extra, symlink or alias byte is trusted.
+        if not pending and observed != aliases[name].get("fingerprint"):
+            raise PreservationError("library_alias_changed")
+
+
+def _guard_policy() -> str:
+    return digest(canonical(["complete-utf8-ignore-stream-v2", [[p.pattern, p.flags] for p in _SECRET_PATTERNS]]))
+
+
+def _fingerprints(folder: Path, names: Sequence[str]) -> dict:
+    return {name: fingerprint(folder / name) for name in names}
+
+
+def _existing_fingerprints(folder: Path, names: Sequence[str]) -> dict | None:
+    try:
+        return _fingerprints(folder, names)
+    except FileNotFoundError:
+        return None
+
+
+def _existing_fingerprint(path: Path) -> dict | None:
+    try:
+        return fingerprint(path)
+    except FileNotFoundError:
+        return None
+
+
+def _saved_json(store: Store, key: str) -> dict:
+    try:
+        value = json.loads(store.setting(key, "{}"))
+        return value if isinstance(value, dict) else {}
+    except ValueError:
+        return {}
 
 
 def _safe_code(exc: Exception, fallback: str) -> str:
@@ -160,7 +208,136 @@ def _card(source: dict) -> bytes:
     return text.encode()
 
 
-def export_versions(store: Store, library_root: Path, *, limit: int = 100) -> dict:
+def _validated_sources(store: Store, manifest: dict, source_files: dict, *, audit: bool, fence=None) -> None:
+    vid = manifest["version_id"]
+    semantic = {k: manifest[k] for k in ("source_key", "scope", "kind", "title", "metadata")}
+    sid = "ols-" + digest(canonical([manifest["scope"], manifest["source_key"]]))
+    expected = "olv-" + digest(canonical([sid, manifest["original_sha256"], manifest["text_sha256"], semantic]))
+    if sid != manifest["source_id"] or expected != vid:
+        raise PreservationError("source_manifest_mismatch")
+    key = "library_source_validation:" + vid
+    prior = _saved_json(store, key)
+    if not audit and prior.get("source_files") == source_files:
+        return
+    for name, hash_key in (("original", "original_sha256"), ("text.txt", "text_sha256")):
+        if fence:
+            fence()
+        if hash_file(store.versions / vid / name, timeout=5) != manifest[hash_key]:
+            raise PreservationError("source_hash_mismatch")
+    if fence:
+        fence()
+    store.set_setting(key, canonical({"source_files": source_files, "manifest_sha256": digest(canonical(manifest))}).decode())
+
+
+def _guard_sources(store: Store, manifest: dict, source_files: dict, policy: str, *, fence=None) -> None:
+    vid = manifest["version_id"]
+    key = "library_guard:" + vid
+    prior = _saved_json(store, key)
+    if prior.get("policy") == policy and prior.get("source_files") == source_files:
+        return
+    work_key = "library_guard_progress:" + vid
+    work = _saved_json(store, work_key)
+    if work.get("policy") != policy or work.get("source_files") != source_files:
+        work = {"policy": policy, "source_files": source_files, "files": {}}
+    for name in ("original", "text.txt"):
+        if work["files"].get(name, {}).get("complete"):
+            continue
+        source = store.versions / vid / name
+        if fence:
+            fence()
+        if source_files[name]["bytes"] <= 1024**2:
+            guard_no_secrets(read_file(source, max_bytes=1024**2))
+            work["files"][name] = {"complete": True}
+        else:
+            work["files"][name] = scan_guard_file(source, checkpoint=work["files"].get(name))
+        if fence:
+            fence()
+        store.set_setting(work_key, canonical(work).decode())
+        if not work["files"][name]["complete"]:
+            raise PreservationError("library_guard_pending")
+    store.set_setting(key, canonical({"policy": policy, "source_files": source_files,
+        "manifest_sha256": digest(canonical(manifest)), "original_sha256": manifest["original_sha256"],
+        "text_sha256": manifest["text_sha256"]}).decode())
+    with store.connect(write=True) as db:
+        db.execute("DELETE FROM settings WHERE key=?", (work_key,))
+
+
+def _copy_source_path(store: Store, root: Path, vid: str, name: str, target: Path,
+                      expected_hash: str, source_info: dict, *, audit: bool, fence=None) -> bool:
+    namespace = digest(str(root).encode()) + ":" + vid + ":" + name
+    key = "library_copy:" + namespace
+    completed_key = "library_file:" + namespace
+    copy = _saved_json(store, key)
+    saved = _saved_json(store, completed_key)
+    existing = _existing_fingerprint(target)
+    if existing:
+        if not (not audit and saved.get("fingerprint") == existing and saved.get("sha256") == expected_hash):
+            if existing["bytes"] != source_info["bytes"] or hash_file(target, timeout=5) != expected_hash:
+                raise PreservationError("library_existing_bytes_conflict")
+        if fence:
+            fence()
+        store.set_setting(completed_key, canonical({"fingerprint": existing, "sha256": expected_hash}).decode())
+        return False
+    staging_root = _directory(root, ".olympus-staging")
+    if not copy:
+        if fence:
+            fence()
+        folder = Path(tempfile.mkdtemp(prefix="copy-", dir=staging_root))
+        copy = {"path": str(folder / name), "source": source_info, "offset": 0, "sha256": expected_hash}
+        store.set_setting(key, canonical(copy).decode())
+    stage = Path(copy["path"])
+    if (stage.parent.parent != staging_root or stage.parent.is_symlink() or stage.name != name
+            or copy.get("source") != source_info or copy.get("sha256") != expected_hash):
+        raise PreservationError("library_copy_checkpoint_conflict")
+    if copy["offset"] < source_info["bytes"]:
+        if fence:
+            fence()
+        copied = copy_window(store.versions / vid / name, stage, offset=copy["offset"])
+        if fence:
+            fence()
+        copy["offset"] = copied["offset"]
+        store.set_setting(key, canonical(copy).decode())
+        if not copied["complete"]:
+            raise PreservationError("library_copy_pending")
+    elif not stage.exists():
+        # Empty files still require a complete owned staging file.
+        stage.touch(mode=0o600, exist_ok=False)
+    if fence:
+        fence()
+    publish_file(stage, target, expected_hash)
+    if fence:
+        fence()
+    store.set_setting(completed_key, canonical({"fingerprint": fingerprint(target), "sha256": expected_hash}).decode())
+    stage.unlink(); stage.parent.rmdir()
+    with store.connect(write=True) as db:
+        db.execute("DELETE FROM settings WHERE key=?", (key,))
+    return True
+
+
+def _publish_version(store: Store, root: Path, folder: Path, manifest: dict, source_files: dict,
+                     aliases: dict, *, audit: bool, fence=None) -> bool:
+    _validated_sources(store, manifest, source_files, audit=audit, fence=fence)
+    _guard_sources(store, manifest, source_files, _guard_policy(), fence=fence)
+    metadata = canonical(manifest)
+    guard_no_secrets(metadata)
+    # Small bundles retain the same no-clobber publication path. Large payloads
+    # never become Python bytes in the parent; each copy attempt is at most 32MiB.
+    if max(source_files[name]["bytes"] for name in ("original", "text.txt")) <= 1024**2:
+        return _publish_files(folder, {"original": read_file(store.versions / manifest["version_id"] / "original", max_bytes=1024**2),
+            "text.txt": read_file(store.versions / manifest["version_id"] / "text.txt", max_bytes=1024**2),
+            "manifest.json": metadata}, strict=True, allowed_aliases=aliases, fence=fence)
+    folder.mkdir(exist_ok=True, mode=0o700)
+    _check_inventory(folder, {"original", "text.txt", "manifest.json"}, aliases)
+    published = False
+    for name, hash_key in (("original", "original_sha256"), ("text.txt", "text_sha256")):
+        published = _copy_source_path(store, root, manifest["version_id"], name, folder / name,
+            manifest[hash_key], source_files[name], audit=audit, fence=fence) or published
+    return _publish_files(folder, {"manifest.json": metadata}, strict=False, fence=fence) or published
+
+
+def export_versions(store: Store, library_root: Path, *, limit: int = 100,
+                    audit: bool = False, time_budget: float = 10,
+                    progress: Callable[[dict], None] | None = None) -> dict:
     """Stage at most ``limit`` registered versions and short source cards.
 
     A persisted cursor rotates through non-forgotten versions, including those
@@ -168,12 +345,16 @@ def export_versions(store: Store, library_root: Path, *, limit: int = 100) -> di
     No existing bytes are overwritten or deleted, including inactive history.
     """
     _limit(limit)
+    if not 0 < time_budget <= 300:
+        raise PreservationError("invalid_library_time_budget")
+    deadline = time.monotonic() + time_budget
     root = _root(library_root, create=True)
     if root == store.root or root in store.root.parents or store.root in root.parents:
         raise PreservationError("library_and_state_must_be_separate")
     key = "library_export_cursor:" + digest(str(root).encode())
     result = {"checked": 0, "exported": 0, "already_present": 0, "errors": [],
-              "staged": [], "remote_verified": 0, "cycle_complete": False}
+              "staged": [], "remote_verified": 0, "cycle_complete": False, "deferred": 0,
+              "cached": 0, "bytes_checked": 0, "warnings": [], "pending": [], "hot_resumed": 0}
     with _lock(store, "export:" + str(root)):
         corpus = _directory(root, "Corpus")
         cards = _directory(_directory(root, "Library"), "Sources")
@@ -188,40 +369,172 @@ def export_versions(store: Store, library_root: Path, *, limit: int = 100) -> di
                     s.source_key,s.scope,s.kind AS source_kind FROM versions v
                     JOIN sources s ON s.id=v.source_id WHERE s.forgotten_at IS NULL
                     ORDER BY v.id LIMIT ?""", (limit + 1,))]
-        result["cycle_complete"] = len(rows) <= limit
-        for row in rows[:limit]:
+            hot = db.execute("""SELECT v.id AS version_id,v.source_id,s.source_key,
+                s.scope,s.kind AS source_kind FROM versions v JOIN sources s ON s.id=v.source_id
+                JOIN settings st ON st.key='drive_staged:'||v.id
+                WHERE s.forgotten_at IS NULL AND
+                CASE WHEN json_valid(st.value) THEN json_extract(st.value,'$.status') END='in_progress'
+                ORDER BY coalesce(json_extract(st.value,'$.last_attempt_at'),0),v.id LIMIT 1""").fetchone()
+        # One resume slot shares the existing item/time budget. The normal cursor
+        # only advances for normal inventory rows, so hot work cannot skip sources.
+        normal = rows[:limit - bool(hot)]
+        work_rows = ([{**dict(hot), "_hot": True}] if hot else []) + [r for r in normal if not hot or r["version_id"] != hot["version_id"]]
+        fresh_ids = {r["version_id"] for r in rows}
+        visited = set()
+        result["cycle_complete"] = not rows
+        for row in work_rows:
+            if result["checked"] and time.monotonic() >= deadline:
+                break
             vid = row["version_id"]
+            result["hot_resumed"] += bool(row.get("_hot"))
             result["checked"] += 1
+            prior = _saved_json(store, "drive_staged:" + vid)
+            def fence():
+                if progress:
+                    progress({"version_id": vid, "checked": result["checked"], "deferred": result["deferred"]})
             try:
-                value = store.read_version(vid)
-                if value["source_id"] != row["source_id"]:
+                fence()
+                if not audit and prior.get("next_attempt_at", 0) > time.time():
+                    result["deferred"] += 1
+                    continue
+                source_folder = store.versions / vid
+                captured_manifest = store.read_manifest(vid)
+                if (captured_manifest["source_id"] != row["source_id"]
+                        or any(captured_manifest[k] != row[r] for k, r in
+                               (("source_key", "source_key"), ("scope", "scope"), ("kind", "source_kind")))):
                     raise PreservationError("library_source_id_mismatch")
-                manifest = canonical({k: v for k, v in value.items() if k not in {"original", "text"}})
+                source_files = _fingerprints(source_folder, ("original", "text.txt", "manifest.json", "manifest.sha256"))
+                version_dir = _directory(corpus, row["source_id"]) / vid
+                policy = _guard_policy()
+                aliases = _saved_json(store, "library_names:" + digest(str(root).encode()) + ":" + vid).get("aliases", {})
+                pending_aliases = [name for name, proof in aliases.items() if proof.get("verification") == "pending"]
+                if pending_aliases:
+                    result["warnings"].append({"version_id": vid, "code": "library_alias_verification_pending", "aliases": pending_aliases})
+                card_path = cards / (row["source_id"] + ".md")
+                if version_dir.exists():
+                    _check_inventory(version_dir, {"original", "text.txt", "manifest.json"}, aliases)
+                if (not audit and prior.get("status") == "local_staged"
+                        and prior.get("path") == str(version_dir) and prior.get("guard_policy") == policy
+                        and prior.get("source_files") == source_files
+                        and prior.get("files") == _existing_fingerprints(version_dir, ("original", "text.txt", "manifest.json"))
+                        and prior.get("card") == _existing_fingerprint(card_path)):
+                    result["already_present"] += 1
+                    result["cached"] += 1
+                    continue
+                manifest = canonical(captured_manifest)
                 card = _card(row)
-                for exported_bytes in (value["original"], value["text"].encode(), manifest, card):
-                    guard_no_secrets(exported_bytes)
-                source_dir = _directory(corpus, value["source_id"])
-                version_dir = source_dir / vid
-                published = _publish_files(version_dir, {
-                    "original": value["original"], "text.txt": value["text"].encode(),
-                    "manifest.json": manifest,
-                }, strict=True)
-                _publish_files(cards, {value["source_id"] + ".md": card}, strict=False)
+                guard_no_secrets(card)
+                published = _publish_version(store, root, version_dir, captured_manifest, source_files, aliases, audit=audit, fence=fence)
+                _publish_files(cards, {captured_manifest["source_id"] + ".md": card}, strict=False, fence=fence)
+                fence()
                 staged = {"path": str(version_dir), "manifest_sha256": digest(manifest),
-                          "status": "local_staged", "remote_copy": "unconfirmed"}
+                          "status": "local_staged", "remote_copy": "unconfirmed", "guard_policy": policy,
+                          "source_files": source_files,
+                          "files": _fingerprints(version_dir, ("original", "text.txt", "manifest.json")),
+                          "card": fingerprint(card_path), "checked_at": time.time()}
                 store.set_setting("drive_staged:" + vid, canonical(staged).decode())
                 result["exported" if published else "already_present"] += 1
-                result["staged"].append({"source_id": value["source_id"], "version_id": vid,
+                result["bytes_checked"] += source_files["original"]["bytes"] + source_files["text.txt"]["bytes"]
+                result["staged"].append({"source_id": captured_manifest["source_id"], "version_id": vid,
                                          "path": str(version_dir), "manifest_sha256": digest(manifest)})
             except (PreservationError, OSError, ValueError) as exc:
+                if isinstance(exc, PreservationError) and str(exc) == "stage_lease_lost":
+                    raise
+                fence()
                 code = _safe_code(exc, "library_export_io_error")
-                result["errors"].append({"version_id": vid, "code": code})
+                ongoing = code in {"library_guard_pending", "library_copy_pending"}
+                result["pending" if ongoing else "errors"].append({"version_id": vid, "code": code})
+                deferred = code in {"materialization_pending", "file_read_timeout", "file_read_io_error"}
+                if deferred:
+                    result["deferred"] += 1
+                if ongoing:
+                    result["deferred"] += 1
                 store.set_setting("drive_staged:" + vid, canonical({
-                    "status": "error", "code": code, "remote_copy": "unconfirmed",
+                    "status": "materialization_pending" if deferred else "in_progress" if ongoing else "error", "code": code,
+                    "remote_copy": "unconfirmed", "errno": getattr(exc, "errno", None),
+                    "last_attempt_at": time.time(),
+                    "next_attempt_at": time.time() + 60 if deferred else 0,
                 }).decode())
-        next_cursor = "" if result["cycle_complete"] else rows[limit - 1]["version_id"]
-        store.set_setting(key, next_cursor)
+            finally:
+                fence()
+                visited.add(vid)
+                result["cycle_complete"] = fresh_ids <= visited
+                if result["cycle_complete"]:
+                    store.set_setting(key, "")
+                elif not row.get("_hot"):
+                    store.set_setting(key, vid)
+                if progress:
+                    progress({k: result[k] for k in ("checked", "exported", "cached", "deferred", "bytes_checked")})
     return result
+
+
+def repair_original_names(store: Store, library_root: Path, version_ids: Sequence[str], *,
+                          preserve_unverified_aliases: bool = False) -> dict:
+    """Restore canonical names after exact verification, preserving every alias.
+
+    Only the observed PDF aliases are supported. Unknown extras or different
+    bytes stop this version before publication; no source or remote copy is
+    deleted. The versioned receipt authorizes only these exact local aliases.
+    """
+    root = _root(library_root, create=False)
+    repaired, errors, pending = [], [], []
+    with _lock(store, "export:" + str(root)):
+        for vid in version_ids:
+            try:
+                manifest = store.read_manifest(vid)
+                with store.connect() as db:
+                    row = db.execute("SELECT s.forgotten_at FROM versions v JOIN sources s ON s.id=v.source_id WHERE v.id=?", (vid,)).fetchone()
+                if row is None or row["forgotten_at"]:
+                    raise PreservationError("library_source_not_exportable")
+                folder = root / "Corpus" / manifest["source_id"] / vid
+                if folder.is_symlink() or folder.parent.is_symlink():
+                    raise PreservationError("library_directory_symlink")
+                names = {p.name for p in folder.iterdir()}
+                extras = names - {"original", "text.txt", "manifest.json", ".DS_Store"}
+                if not extras or extras - {"original.pdf", "original (1).pdf"}:
+                    raise PreservationError("library_names_require_review")
+                expected = manifest["original_sha256"]
+                if hash_file(store.versions / vid / "original", timeout=60) != expected:
+                    raise PreservationError("source_hash_mismatch")
+                aliases = {}
+                for name in sorted(extras):
+                    try:
+                        if hash_file(folder / name, timeout=5) != expected:
+                            raise PreservationError("library_alias_bytes_conflict")
+                        aliases[name] = {"verification": "verified", "sha256": expected}
+                    except PreservationError as exc:
+                        if not preserve_unverified_aliases or str(exc) not in {"materialization_pending", "file_read_timeout", "file_read_io_error"}:
+                            raise
+                        aliases[name] = {"verification": "pending", "code": str(exc)}
+                original = folder / "original"
+                if original.exists():
+                    if hash_file(original, timeout=5) != expected:
+                        raise PreservationError("library_existing_bytes_conflict")
+                else:
+                    verified_alias = next((name for name in sorted(extras) if aliases[name]["verification"] == "verified"), None)
+                    if verified_alias:
+                        os.link(folder / verified_alias, original, follow_symlinks=False)
+                    else:
+                        data = (store.versions / vid / "original").read_bytes()
+                        if digest(data) != expected:
+                            raise PreservationError("source_hash_mismatch")
+                        guard_no_secrets(data)
+                        _publish_files(folder, {"original": data}, strict=False)
+                    _sync_directory(folder)
+                for name in aliases:
+                    aliases[name]["fingerprint"] = fingerprint(folder / name, allow_dataless=aliases[name]["verification"] == "pending")
+                unresolved = [name for name in aliases if aliases[name]["verification"] == "pending"]
+                if unresolved:
+                    pending.append({"version_id": vid, "aliases": unresolved})
+                receipt = {"schema": 2, "version_id": vid, "manifest_sha256": digest(canonical(manifest)),
+                           "canonical": {"original": {"sha256": expected, "fingerprint": fingerprint(original)}},
+                           "aliases": aliases, "status": "canonical_name_restored", "checked_at": time.time()}
+                store.set_setting("library_names:" + digest(str(root).encode()) + ":" + vid, canonical(receipt).decode())
+                repaired.append(vid)
+            except (PreservationError, OSError) as exc:
+                errors.append({"version_id": vid, "code": _safe_code(exc, "library_names_io_error"),
+                               "errno": getattr(exc, "errno", None)})
+    return {"repaired": repaired, "errors": errors, "aliases_pending": pending, "deleted": 0}
 
 
 def _file_identity(info: os.stat_result) -> str:
@@ -293,13 +606,11 @@ def _inventory(root: Path, selected: Sequence[str], limit: int) -> tuple[list[tu
 def _read_note(path: Path, expected: os.stat_result, max_bytes: int) -> tuple[bytes, str]:
     if expected.st_size > max_bytes:
         raise PreservationError("note_size_limit")
-    fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK | getattr(os, "O_NOFOLLOW", 0))
-    with os.fdopen(fd, "rb") as stream:
-        before = os.fstat(stream.fileno())
-        if not stat.S_ISREG(before.st_mode) or _file_identity(before) != _file_identity(expected):
-            raise PreservationError("note_changed_during_scan")
-        raw = stream.read(max_bytes + 1)
-        after = os.fstat(stream.fileno())
+    before = path.stat(follow_symlinks=False)
+    if not stat.S_ISREG(before.st_mode) or _file_identity(before) != _file_identity(expected):
+        raise PreservationError("note_changed_during_scan")
+    raw = read_file(path, max_bytes=max_bytes, timeout=2)
+    after = path.stat(follow_symlinks=False)
     current = path.stat(follow_symlinks=False)
     observed = lambda st: (_file_identity(st), st.st_size, st.st_mtime_ns)
     if len(raw) > max_bytes:
@@ -321,7 +632,8 @@ def _read_note(path: Path, expected: os.stat_result, max_bytes: int) -> tuple[by
 
 
 def scan_notes(store: Store, library_root: Path, *, selected: Sequence[str],
-               scope: str, limit: int = 100, max_bytes: int = 8 * 1024 * 1024) -> dict:
+               scope: str, limit: int = 100, max_bytes: int = 8 * 1024 * 1024,
+               time_budget: float = 5, progress=None) -> dict:
     """Capture text versions only from explicitly selected approved subtrees.
 
     File identities and atomic replacement at the same full path preserve a
@@ -329,6 +641,9 @@ def scan_notes(store: Store, library_root: Path, *, selected: Sequence[str],
     conflict is never silently treated as an owner-approved supersession.
     """
     _limit(limit)
+    if not 0 < time_budget <= 300:
+        raise PreservationError("invalid_library_time_budget")
+    deadline = time.monotonic() + time_budget
     if (not selected or isinstance(selected, str) or not all(isinstance(item, str) for item in selected)
             or len(set(selected)) != len(selected)
             or any(item not in _SELECTABLE for item in selected)):
@@ -372,7 +687,14 @@ def scan_notes(store: Store, library_root: Path, *, selected: Sequence[str],
         with store.connect() as db:
             forgotten = {r[0] for r in db.execute("SELECT id FROM sources WHERE forgotten_at IS NOT NULL")}
         processed_keys: set[str] = set()
-        for relative, info in candidates:
+        for candidate_index, (relative, info) in enumerate(candidates):
+            if candidate_index and time.monotonic() >= deadline:
+                complete = False
+                result["complete_scan"] = False
+                result["issues"].append({"code": "note_time_budget_reached"})
+                break
+            if progress:
+                progress({"checked": candidate_index, "captured": result["captured"]})
             path = root / relative
             try:
                 guard_no_secrets(path.as_uri().encode())
@@ -418,6 +740,8 @@ def scan_notes(store: Store, library_root: Path, *, selected: Sequence[str],
                 if source_key in processed_keys:
                     raise PreservationError("note_identity_reused_in_scan")
                 title = prior["title"] if prior else path.stem
+                if progress:
+                    progress({"checked": candidate_index, "captured": result["captured"], "state": "before_capture"})
                 if prior is None:
                     # Reserve the source identity before capture. A process exit
                     # after Store.capture cannot create a new UUID on the retry.
@@ -447,6 +771,8 @@ def scan_notes(store: Store, library_root: Path, *, selected: Sequence[str],
                 result["versions"].append({"source_id": receipt.source_id, "version_id": receipt.version_id,
                                             "file_ref": digest(relative.encode())[:24]})
             except (PreservationError, OSError) as exc:
+                if isinstance(exc, PreservationError) and str(exc) == "stage_lease_lost":
+                    raise
                 result["issues"].append(_issue(relative, _safe_code(exc, "note_read_failed")))
         if complete:
             for entry in entries.values():
@@ -454,5 +780,7 @@ def scan_notes(store: Store, library_root: Path, *, selected: Sequence[str],
                     if entry["path"] not in seen:
                         entry["missing"] = True
                         result["missing"].append(entry["source_id"])
+        if progress:
+            progress({"captured": result["captured"], "state": "before_registry_commit"})
         store.set_setting(registry_key, canonical(registry).decode())
     return result

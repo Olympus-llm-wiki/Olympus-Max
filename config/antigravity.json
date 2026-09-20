@@ -1,0 +1,7 @@
+{
+  "version": "1.2.7",
+  "url": "https://storage.googleapis.com/antigravity-public/antigravity-cli/1.2.7-6731160148115456/darwin-arm/cli_mac_arm64.tar.gz",
+  "sha512": "e26032ce420985a18e720b6ec1c09d8360aed851d3e3345148c9a052b7918989a52b62dd2c8db453599ea341b8b29720737846ffd37dd9c68b6bc6ece4a05994",
+  "manifest_url": "https://antigravity-cli-auto-updater-974169037036.us-central1.run.app/manifests/darwin_arm64.json",
+  "checked_at": "2026-09-20"
+}

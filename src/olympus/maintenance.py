@@ -16,9 +16,10 @@ from .hindsight import HindsightError
 from .preservation import Store, PreservationError, canonical, digest, timestamp
 
 QUIET_PROOF_MAX_AGE_SECONDS = 90
-MAX_OPERATIONS = 1000
+MAX_OPERATIONS = 100000
 MAX_CHANGES = 100
 MAX_DOCUMENTS = 100
+MAX_NATIVE_DOCUMENTS = 50000
 MAX_DRAIN_PASSES = 4
 MAX_WALL_SECONDS = 120
 _DERIVATIVE_TASKS = frozenset({"consolidation", "graph_maintenance", "vector_index_maintenance"})
@@ -171,18 +172,26 @@ def reconcile_no_pages(store: Store, client, *, assert_quiet: Callable[[], dict]
             if any(c.get("kind") not in {"forget", "supersede"} or type(c.get("id")) is not int for c in changes):
                 raise _Barrier("unsupported_change_contract")
             change_ids = [c["id"] for c in changes]
-            documents = sorted({document for change in changes for document in store.change_documents(change)})
-            if not documents or len(documents) > MAX_DOCUMENTS:
+            canonical_documents = sorted({document for change in changes for document in store.change_documents(change)})
+            if not canonical_documents or len(canonical_documents) > MAX_DOCUMENTS:
                 raise _Barrier("changed_document_inventory_limit")
-            if any(not re.fullmatch(r"olv-[a-f0-9]{64}", doc) for doc in documents):
+            if any(not re.fullmatch(r"olv-[a-f0-9]{64}", doc) for doc in canonical_documents):
                 raise _Barrier("invalid_changed_document_id")
-            result["target_document_ids"] = documents
             with store.connect() as db:
                 rows = [dict(db.execute("""SELECT v.id,v.source_id,v.active,d.operation_id
-                    FROM versions v JOIN delivery d ON d.version_id=v.id WHERE v.id=?""", (doc,)).fetchone() or {}) for doc in documents]
+                    FROM versions v JOIN delivery d ON d.version_id=v.id WHERE v.id=?""", (doc,)).fetchone() or {}) for doc in canonical_documents]
             if any(not r or r["active"] != 0 for r in rows):
                 raise _Barrier("changed_version_not_withdrawn")
-            target_ops = {_uuid(row["operation_id"]): row["id"] for row in rows}
+            from .representations import native_targets_for_versions
+            targets = native_targets_for_versions(store, canonical_documents)
+            documents = sorted({row["document_id"] for row in targets})
+            if len(documents) > MAX_NATIVE_DOCUMENTS:
+                raise _Barrier("changed_native_document_inventory_limit")
+            if any(not re.fullmatch(r"(?:olv|olr)-[a-f0-9]{64}", doc) for doc in documents):
+                raise _Barrier("invalid_changed_document_id")
+            result["target_document_ids"] = documents
+            result["target_version_ids"] = canonical_documents
+            target_ops = {_uuid(row["operation_id"]): row["document_id"] for row in targets}
             target_set = set(documents)
             snapshot_hash = digest(canonical(changes))
             initial_quiet_at = quiet()
@@ -303,6 +312,7 @@ def reconcile_no_pages(store: Store, client, *, assert_quiet: Callable[[], dict]
             receipt = {
                 "schema": 1, "mode": "no-pages-bank-reset", "change_ids": change_ids,
                 "change_snapshot_sha256": snapshot_hash, "document_ids": documents,
+                "version_ids": canonical_documents,
                 "counts": final_counts, "quiet_checked_at": final_quiet_at,
                 "initial_quiet_checked_at": initial_quiet_at, "verified_at": timestamp(),
             }

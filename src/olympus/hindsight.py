@@ -19,12 +19,22 @@ from datetime import datetime
 from typing import Any
 
 
+# These can describe an accepted write whose acknowledgement was unusable.
+# A caller with a reserved attempt must reconcile its UUID before freeing WIP.
+UNCONFIRMED_RESPONSE_CODES = frozenset({
+    "invalid_submit_response", "invalid_retry_response", "invalid_operation_response",
+    "invalid_json", "invalid_response", "incomplete_response", "invalid_content_length",
+    "unexpected_content_type", "unexpected_content_encoding", "response_too_large",
+})
+
+
 class HindsightError(Exception):
     """A log-safe error: never includes URLs, credentials or upstream bodies."""
 
-    def __init__(self, code: str, status: int | None = None):
+    def __init__(self, code: str, status: int | None = None, *, retry_after: float | None = None):
         self.code = code
         self.status = status
+        self.retry_after = retry_after
         super().__init__(code if status is None else f"{code} (HTTP {status})")
 
 
@@ -165,8 +175,11 @@ class HindsightClient:
                     raise HindsightError("incomplete_response", status)
         except urllib.error.HTTPError as error:
             status = error.code
+            retry_after = error.headers.get("Retry-After", "")
+            retry_after = min(float(retry_after), 604800) if re.fullmatch(r"[0-9]{1,9}", retry_after) else None
             error.close()
-            raise HindsightError("redirect_refused" if 300 <= status < 400 else "http_error", status) from None
+            raise HindsightError("redirect_refused" if 300 <= status < 400 else "http_error", status,
+                                 retry_after=retry_after) from None
         except urllib.error.URLError as error:
             code = "timeout" if isinstance(error.reason, (TimeoutError, socket.timeout)) else "transport_error"
             raise HindsightError(code) from None
@@ -198,8 +211,20 @@ class HindsightClient:
         if not isinstance(metadata, dict) or any(not isinstance(k, str) or not isinstance(v, str)
                                                  for k, v in metadata.items()):
             raise HindsightError("invalid_metadata")
-        item = {"content": text, "document_id": document_id, "timestamp": timestamp,
-                "metadata": metadata, "tags": _tags(tags), "update_mode": "replace"}
+        from .native_text_projection import project_text
+        from .preservation import PreservationError, canonical, digest
+        try:
+            native_text, projection = project_text(text)
+        except PreservationError as exc:
+            raise HindsightError(str(exc)) from None
+        if not native_text.strip():
+            raise HindsightError('empty_native_text_projection')
+        item = {"content": native_text, "document_id": document_id, "timestamp": timestamp,
+                "metadata": {**metadata, 'olympus_native_text_projection': projection['contract'],
+                             'olympus_canonical_text_sha256': projection['canonical_sha256'],
+                             'olympus_native_text_sha256': projection['native_sha256'],
+                             'olympus_native_projection_sha256': digest(canonical(projection))},
+                "tags": _tags(tags), "update_mode": "replace"}
         if strategy is not None:
             item["strategy"] = _identifier(strategy)
         result = self._request("POST", "/memories", {
@@ -222,8 +247,68 @@ class HindsightClient:
         safe = {"operation_id": operation_id, "status": result["status"]}
         if _nonnegative_int(result.get("retry_count")):
             safe["retry_count"] = result["retry_count"]
+        # Preserve only typed counters/identities. Prose diagnostics, samples,
+        # payloads and arbitrary result_metadata never leave the adapter.
+        metadata = result.get("result_metadata")
+        if metadata is not None and not isinstance(metadata, dict):
+            raise HindsightError("invalid_operation_response")
+        for key in ("extraction_errors_count", "unit_ids_count", "total_tokens", "num_sub_batches"):
+            if key in (metadata or {}):
+                if not _nonnegative_int(metadata[key]):
+                    raise HindsightError("invalid_operation_response")
+                safe[key] = metadata[key]
+        if (metadata or {}).get("document_id") is not None:
+            safe["document_id"] = _identifier(metadata["document_id"])
+        for key in ("created_at", "updated_at", "completed_at", "next_retry_at"):
+            value = result.get(key)
+            if value is not None:
+                try:
+                    parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+                    if parsed.tzinfo is None:
+                        raise ValueError
+                except (ValueError, AttributeError, TypeError):
+                    raise HindsightError("invalid_operation_response") from None
+                safe[key] = parsed.isoformat()
+        progress = result.get("progress")
+        if isinstance(progress, dict):
+            safe["progress"] = {key: progress[key] for key in ("processed", "total")
+                                if _nonnegative_int(progress.get(key))}
+            safe["progress"]["stage"] = (progress.get("stage") if isinstance(progress.get("stage"), str) and progress.get("stage") in
+                {"extracting", "embedding", "storing", "consolidating", "completed"} else "unknown")
+        children = result.get("child_operations")
+        if children is not None:
+            if not isinstance(children, list) or len(children) > 10000:
+                raise HindsightError("invalid_operation_response")
+            safe_children = []
+            seen = set()
+            for child in children:
+                if (not isinstance(child, dict) or not isinstance(child.get("status"), str)
+                        or child.get("status") not in states - {"not_found"}):
+                    raise HindsightError("invalid_operation_response")
+                identifier = _operation_id(child.get("operation_id"))
+                if identifier in seen:
+                    raise HindsightError("invalid_operation_response")
+                seen.add(identifier)
+                safe_children.append({"operation_id": identifier, "status": child["status"]})
+            safe["child_operations"] = safe_children
         if result["status"] == "failed":
             safe["error_code"] = "operation_failed"
+            # Upstream exposes prose only. Classify bounded text into fixed codes;
+            # never return the diagnostic or treat arbitrary text as retry policy.
+            diagnostic = result.get("error_message")
+            if isinstance(diagnostic, str):
+                diagnostic = diagnostic[:16_384].lower()
+                if re.match(r"task exceeded the [0-9]+(?:\.[0-9]+)?s wall-clock limit for '(?:batch_retain|retain)' ", diagnostic):
+                    safe["error_code"] = "source_processing_timeout"
+                elif any(term in diagnostic for term in ("usage_limit_reached", "rate_limit_exceeded", "429 too many requests", "rate limit exceeded")):
+                    safe["error_code"] = "provider_rate_limited"
+                elif any(term in diagnostic for term in ("codex authentication failed", "401 unauthorized", "403 forbidden")):
+                    safe["error_code"] = "provider_authentication_required"
+                elif any(term in diagnostic for term in ("502 bad gateway", "503 service unavailable", "504 gateway timeout", "httpx.connecterror", "httpx.readtimeout", "exceeded max recovery attempts")):
+                    safe["error_code"] = "provider_unavailable"
+                elif ("remoteprotocolerror" in diagnostic
+                      and "peer closed connection without sending complete message body" in diagnostic):
+                    safe["error_code"] = "provider_unavailable"
         return safe
 
     def retry_operation(self, operation_id: str) -> dict:
@@ -233,6 +318,61 @@ class HindsightClient:
         if result.get("success") is not True or result.get("operation_id") != operation_id:
             raise HindsightError("invalid_retry_response")
         return {"success": True, "operation_id": operation_id}
+
+    def retain_profile(self, strategy: str | None = None) -> dict:
+        """Read a resolved extraction profile; a miss must not use native fallback.
+
+        The fingerprint includes behavioral configuration, not source text or
+        credentials. Missions/instructions are hashed, never returned.
+        """
+        if strategy is not None:
+            strategy = _identifier(strategy)
+        result = self._request("GET", "/config")
+        if result.get("bank_id") != self.bank_id or not isinstance(result.get("config"), dict):
+            raise HindsightError("invalid_bank_config_response")
+        config = result["config"]
+        effective = strategy or config.get("retain_default_strategy")
+        resolved = dict(config)
+        if effective is not None:
+            effective = _identifier(effective)
+            strategies = config.get("retain_strategies") or {}
+            if not isinstance(strategies, dict) or not isinstance(strategies.get(effective), dict):
+                raise HindsightError("unknown_retain_strategy")
+            resolved.update(strategies[effective])
+        mode = resolved.get("retain_extraction_mode")
+        if not isinstance(mode, str) or mode not in {"concise", "verbose", "custom", "verbatim", "chunks"}:
+            raise HindsightError("invalid_bank_config_response")
+        chunk_size = resolved.get("retain_chunk_size")
+        if type(chunk_size) is not int or chunk_size < 1:
+            raise HindsightError("invalid_bank_config_response")
+        behavior = {k: resolved.get(k) for k in (
+            "retain_extraction_mode", "retain_chunk_size", "retain_structured_chunk_size",
+            "retain_mission", "retain_custom_instructions", "entity_labels", "entities_allow_free_form",
+            "store_document_text")}
+        # Native GET/config deliberately omits static executor fields. The
+        # owned worker proxy supplies only this authenticated, fixed whitelist.
+        executor = result.get("olympus_executor")
+        execution = None
+        if executor is not None:
+            keys = ("llm_provider", "retain_llm_provider", "llm_model", "retain_llm_model",
+                    "llm_reasoning_effort", "retain_llm_reasoning_effort")
+            if (not isinstance(executor, dict) or type(executor.get("schema")) is not int or executor.get("schema") != 1
+                    or executor.get("role") != "worker" or any(key not in executor for key in keys)):
+                raise HindsightError("invalid_executor_profile")
+            raw = {key: _identifier(executor[key]) if executor[key] is not None else None for key in keys}
+            provider = raw["retain_llm_provider"] or raw["llm_provider"]
+            model = raw["retain_llm_model"] or raw["llm_model"]
+            if not provider or provider != "none" and not model:
+                raise HindsightError("invalid_executor_profile")
+            execution = {"configured": raw, "provider": provider, "model": model,
+                         "reasoning_effort": raw["retain_llm_reasoning_effort"] or raw["llm_reasoning_effort"]}
+        behavior["executor"] = execution
+        encoded = json.dumps(behavior, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode()
+        return {"schema": 1, "strategy": strategy, "effective_strategy": effective, "mode": mode,
+                "chunk_size": chunk_size, "config_fingerprint": hashlib.sha256(encoded).hexdigest(),
+                "execution_profile_known": execution is not None, "executor": execution,
+                "bank_auto_consolidation": config.get("enable_auto_consolidation"),
+                "bank_observations": config.get("enable_observations")}
 
     def cancel_operation(self, operation_id: str) -> dict:
         """Cancel pending work. This is not a kill switch for a running worker."""
@@ -336,14 +476,28 @@ class HindsightClient:
             raise HindsightError("invalid_memory_list_response")
         return listed
 
-    def verify_document(self, document_id: str, expected_text_sha256: str) -> dict:
+    def verify_document(self, document_id: str, expected_text_sha256: str, *, expected_text: str | None = None) -> dict:
         document_id = _identifier(document_id)
         if not isinstance(expected_text_sha256, str) or not re.fullmatch(r"[a-f0-9]{64}", expected_text_sha256):
             raise HindsightError("invalid_expected_hash")
+        projection = None
+        native_expected = expected_text_sha256
+        if expected_text is not None:
+            from .native_text_projection import project_text
+            from .preservation import PreservationError
+            try:
+                _, projection = project_text(expected_text, expected_text_sha256)
+            except PreservationError as exc:
+                raise HindsightError(str(exc)) from None
+            native_expected = projection['native_sha256']
         verification = {"document_id": document_id, "exists": False, "text_sha256": None,
                         "expected_text_sha256": expected_text_sha256, "text_matches": False,
+                        "canonical_text_matches": False, "expected_native_text_sha256": native_expected,
+                        "text_match_basis": projection['contract'] if projection else 'canonical_exact',
                         "memory_unit_count": 0, "listed_memory_unit_count": 0,
                         "listed_unit_present": False, "searchable": False}
+        if projection is not None:
+            verification['native_text_projection'] = projection
         try:
             document = self._request("GET", "/documents/" + urllib.parse.quote(document_id, safe=""))
         except HindsightError as error:
@@ -361,7 +515,8 @@ class HindsightClient:
                 digest = hashlib.sha256(document["original_text"].encode("utf-8")).hexdigest()
             except UnicodeError:
                 raise HindsightError("invalid_document_response") from None
-            verification.update(text_sha256=digest, text_matches=digest == expected_text_sha256)
+            verification.update(text_sha256=digest, text_matches=digest == native_expected,
+                                canonical_text_matches=digest == expected_text_sha256)
         listed = self._list_document_memories(document_id)
         present = bool(listed["items"] and isinstance(listed["items"][0].get("id"), str)
                        and listed["items"][0]["id"]

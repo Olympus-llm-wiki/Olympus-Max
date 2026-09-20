@@ -1,0 +1,15 @@
+{
+  "schema": 1,
+  "serena": {
+    "version": "1.7.0",
+    "commit": "949a27ef1e5fda1a6e7b561e777bcece345c6ffd",
+    "source_url": "https://codeload.github.com/oraios/serena/tar.gz/949a27ef1e5fda1a6e7b561e777bcece345c6ffd",
+    "archive_sha256": "bd1155f6429b30bb5ede106b581e5046fe153d1512604f305c7fbc4ee4cd479a",
+    "uv_lock_sha256": "48f88af6b9a7c942820b65d0321176b33b49f0012a8a0cd036ee1f5140cfe167",
+    "python_version": "3.14.6",
+    "pyright_version": "1.1.403",
+    "language_server_route": "Pinned npm pyright with native ls_base_cmd; no uvx interpreter/package auto-download"
+  },
+  "checked_at": "2026-09-20",
+  "source_revision": "c1925c6af06574b39ea5aa512cfaed2c4a862630"
+}

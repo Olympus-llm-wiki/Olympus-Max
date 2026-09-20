@@ -1,0 +1,16 @@
+#!/bin/bash
+set -euo pipefail
+root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+export PATH="/opt/homebrew/bin:$HOME/.local/bin:$PATH"
+if ! command -v uv >/dev/null; then
+  printf '%s\n' 'Сначала запустите Install.command.' >&2; exit 2
+fi
+if [[ $# -eq 0 ]]; then set -- doctor; fi
+case "$1" in
+  project|workspace) entry=ops.py ;;
+  memory)
+    shift
+    if [[ -f "$root/max.py" ]]; then entry=max.py; else entry=olympus.py; fi ;;
+  *) entry=environment.py ;;
+esac
+exec uv run --no-project --python 3.12 python "$root/$entry" "$@"

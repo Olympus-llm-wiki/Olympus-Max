@@ -106,7 +106,10 @@ class HindsightTests(unittest.TestCase):
         self.assertEqual((request["method"], request["path"]), ("POST", PREFIX + "/memories"))
         self.assertEqual(request["body"], {
             "items": [{"content": TEXT, "document_id": DOC, "timestamp": "2026-09-05T11:00:00Z",
-                       "metadata": {"source": "local:test", "text_sha256": DIGEST},
+                   "metadata": {"source": "local:test", "text_sha256": DIGEST,
+                                "olympus_native_text_projection": "hindsight-0.9.2-sanitize-v1",
+                                "olympus_canonical_text_sha256": DIGEST, "olympus_native_text_sha256": DIGEST,
+                                "olympus_native_projection_sha256": request["body"]["items"][0]["metadata"]["olympus_native_projection_sha256"]},
                        "tags": ["project:one"], "strategy": "verbatim", "update_mode": "replace"}],
             "async": True, "operation_id": OP})
         self.assertEqual(result["operation_id"], OP)
@@ -132,6 +135,90 @@ class HindsightTests(unittest.TestCase):
         self.reply({"operation_id": OP, "status": ["completed"]})
         self.error("invalid_operation_response", lambda: self.client.operation(OP))
 
+    def test_failed_provider_diagnostics_have_only_allowlisted_categories(self):
+        for message, expected in [
+            ("HTTPStatusError: 429 Too Many Requests FAKE-SENSITIVE", "provider_rate_limited"),
+            ("usage_limit_reached FAKE-SENSITIVE", "provider_rate_limited"),
+            ("Codex authentication failed FAKE-SENSITIVE", "provider_authentication_required"),
+            ("httpx.ReadTimeout FAKE-SENSITIVE", "provider_unavailable"),
+            ("Fact extraction failed: RemoteProtocolError: peer closed connection without sending complete message body (incomplete chunked read) FAKE-SENSITIVE", "provider_unavailable"),
+            ("unknown failure FAKE-SENSITIVE", "operation_failed"),
+        ]:
+            self.reply({"operation_id": OP, "status": "failed", "error_message": message})
+            result = self.client.operation(OP)
+            self.assertEqual(result["error_code"], expected)
+            self.assertNotIn("FAKE", repr(result))
+
+    def test_native_wall_timeout_is_source_scoped_and_hides_diagnostic(self):
+        self.reply({"operation_id": OP, "status": "failed", "error_message":
+                    "Task exceeded the 3600s wall-clock limit for 'batch_retain' "
+                    "(stage=llm.codex.retain_extract_facts.attempt=1/1) and was cancelled. FAKE-SENSITIVE"})
+        result = self.client.operation(OP)
+        self.assertEqual(result["error_code"], "source_processing_timeout")
+        self.assertNotIn("FAKE", repr(result))
+
+    def test_native_completion_retains_safe_counters_children_and_schedule(self):
+        child = "f72df4ef-e51a-427c-8288-80c52f1760d6"
+        self.reply({"operation_id": OP, "status": "completed", "completed_at": "2026-09-09T10:00:00Z",
+                    "next_retry_at": None, "result_metadata": {"extraction_errors_count": 2,
+                    "unit_ids_count": 34, "num_sub_batches": 1, "extraction_errors_sample": ["FAKE-SECRET"]},
+                    "progress": {"stage": "storing", "processed": 10, "total": 10, "detail": "FAKE-SECRET"},
+                    "child_operations": [{"operation_id": child, "status": "completed", "error_message": "FAKE-SECRET"}]})
+        result = self.client.operation(OP)
+        self.assertEqual(result["extraction_errors_count"], 2)
+        self.assertEqual(result["child_operations"], [{"operation_id": child, "status": "completed"}])
+        self.assertEqual(result["progress"], {"stage": "storing", "processed": 10, "total": 10})
+        self.assertNotIn("FAKE", repr(result))
+        for value in (-1, True, "2"):
+            self.reply({"operation_id": OP, "status": "completed", "result_metadata": {"extraction_errors_count": value}})
+            self.error("invalid_operation_response", lambda: self.client.operation(OP))
+
+    def test_retain_profile_rejects_unknown_strategy_and_hides_instructions(self):
+        config = {"retain_extraction_mode": "concise", "retain_chunk_size": 3000,
+                  "retain_custom_instructions": "PRIVATE-INSTRUCTIONS", "enable_auto_consolidation": False,
+                  "retain_strategies": {"source_chunks_v1": {"retain_extraction_mode": "chunks"}}}
+        self.reply({"bank_id": BANK, "config": config})
+        profile = self.client.retain_profile("source_chunks_v1")
+        self.assertEqual(profile["mode"], "chunks")
+        self.assertFalse(profile["execution_profile_known"])
+        self.assertEqual(len(profile["config_fingerprint"]), 64)
+        self.assertNotIn("PRIVATE", repr(profile))
+        self.assertEqual(self.server.requests[-1]["path"], PREFIX + "/config")
+        self.reply({"bank_id": BANK, "config": config})
+        self.error("unknown_retain_strategy", lambda: self.client.retain_profile("typo"))
+
+    def test_executor_profile_inheritance_is_pinned_without_credentials(self):
+        config = {"retain_extraction_mode": "concise", "retain_chunk_size": 3000}
+        executor = {"schema": 1, "role": "worker", "llm_provider": "openai-codex", "retain_llm_provider": None,
+                    "llm_model": "gpt-5.6-terra", "retain_llm_model": "gpt-5.6-luna",
+                    "llm_reasoning_effort": "low", "retain_llm_reasoning_effort": None, "api_key": "FAKE-SECRET"}
+        self.reply({"bank_id": BANK, "config": config, "olympus_executor": executor})
+        first = self.client.retain_profile()
+        self.assertTrue(first["execution_profile_known"])
+        self.assertEqual(first["executor"]["provider"], "openai-codex")
+        self.assertEqual(first["executor"]["model"], "gpt-5.6-luna")
+        self.assertEqual(first["executor"]["reasoning_effort"], "low")
+        self.assertNotIn("FAKE", repr(first))
+        self.reply({"bank_id": BANK, "config": config, "olympus_executor": {**executor, "retain_llm_model": "gpt-5.6-terra"}})
+        self.assertNotEqual(first["config_fingerprint"], self.client.retain_profile()["config_fingerprint"])
+
+    def test_http_rate_limit_retains_only_bounded_retry_after(self):
+        self.reply({}, status=429, headers={"Retry-After": "7200"})
+        error = self.error("http_error", lambda: self.client.operation(OP), 429)
+        self.assertEqual(error.retry_after, 7200)
+
+    def test_large_native_transport_preserves_complete_text_and_readback(self):
+        text = '🙂\\\n' * 1_300_000
+        sha = hashlib.sha256(text.encode()).hexdigest()
+        client = HindsightClient(self.server.url, BANK, max_request_bytes=64 * 1024 * 1024,
+                                 max_response_bytes=64 * 1024 * 1024)
+        self.reply(self.ack())
+        client.submit(DOC, OP, text, "unset", {}, [])
+        self.assertEqual(self.server.requests[-1]["body"]["items"][0]["content"], text)
+        self.reply(self.document(original_text=text))
+        self.reply(self.memories())
+        self.assertTrue(client.verify_document(DOC, sha)["searchable"])
+
     def test_searchable_needs_exact_text_and_document_filtered_real_unit(self):
         self.reply(self.document())
         self.reply(self.memories())
@@ -141,6 +228,47 @@ class HindsightTests(unittest.TestCase):
         self.assertEqual(result["memory_unit_count"], 2)
         self.assertEqual(self.server.requests[0]["path"], PREFIX + "/documents/source%3Aexample-v1")
         self.assertEqual(self.server.requests[1]["path"], PREFIX + "/memories/list?document_id=source%3Aexample-v1&limit=1")
+
+    def test_native_control_projection_matches_without_rewriting_canonical_hash(self):
+        text = 'Русский page\t\r\n \f'
+        expected = hashlib.sha256(text.encode()).hexdigest()
+        native = text.replace('\f', '')
+        self.reply(self.document(original_text=native))
+        self.reply(self.memories())
+        result = self.client.verify_document(DOC, expected, expected_text=text)
+        self.assertTrue(result['searchable'])
+        self.assertFalse(result['canonical_text_matches'])
+        self.assertEqual(result['expected_text_sha256'], expected)
+        projection = result['native_text_projection']
+        self.assertEqual(projection['canonical_sha256'], expected)
+        self.assertEqual(projection['native_sha256'], hashlib.sha256(native.encode()).hexdigest())
+        self.assertEqual(projection['removed_chars'], 1)
+        self.assertEqual(projection['removed_spans'][0]['codepoint'], 12)
+        self.reply(self.document(original_text=native))
+        self.reply(self.memories())
+        self.assertFalse(self.client.verify_document(DOC, expected)['text_matches'])
+
+    def test_projection_rejects_wrong_canonical_hash_before_network(self):
+        self.error('canonical_text_hash_mismatch', lambda: self.client.verify_document(DOC, DIGEST, expected_text='other\f'))
+        self.assertEqual(self.server.requests, [])
+
+    def test_projection_rejects_any_other_native_edit_including_whitespace(self):
+        text = TEXT + '\t \n\f'
+        expected = hashlib.sha256(text.encode()).hexdigest()
+        for remote in (TEXT, TEXT + '\t \nX', TEXT + '\t \n\f'):
+            self.reply(self.document(original_text=remote))
+            self.reply(self.memories())
+            self.assertFalse(self.client.verify_document(DOC, expected, expected_text=text)['searchable'])
+
+    def test_submit_uses_same_versioned_projection_and_explicit_hash_metadata(self):
+        text = TEXT + '\f'
+        self.reply(self.ack())
+        self.client.submit(DOC, OP, text, 'unset', {'text_sha256': hashlib.sha256(text.encode()).hexdigest()}, [])
+        item = self.server.requests[-1]['body']['items'][0]
+        self.assertEqual(item['content'], TEXT)
+        self.assertEqual(item['metadata']['text_sha256'], hashlib.sha256(text.encode()).hexdigest())
+        self.assertEqual(item['metadata']['olympus_native_text_sha256'], DIGEST)
+        self.assertEqual(item['metadata']['olympus_native_text_projection'], 'hindsight-0.9.2-sanitize-v1')
 
     def test_explicit_native_retry_preserves_identity_without_source_resubmission(self):
         self.reply({"success": True, "operation_id": OP, "message": "FAKE-SENSITIVE"})

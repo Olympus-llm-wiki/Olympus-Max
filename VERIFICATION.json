@@ -1,70 +1,28 @@
 {
   "schema": 1,
-  "starter": "Olympus-Max",
-  "distribution_version": "0.2.0",
-  "verified_at": "2026-09-07",
-  "tests_passed": 332,
-  "tests_failed": 0,
-  "private_paths_or_ids": 0,
-  "personal_corpus_included": false,
-  "credentials_included": false,
-  "source_only_template": true,
-  "checks": {
-    "live_hindsight_read_only": "not_repeated_in_this_release",
-    "live_model_access": "not_tested",
-    "synthetic_media_regressions": 24,
-    "distribution_verifier_tests": 5,
-    "local_search_profile_and_outage": true,
-    "skill_upstream_hashes": 25,
-    "skill_frontmatter": {
-      "valid_required_fields": 26,
-      "preserved_claude_extensions": {
-        "wayfinder": [
-          "disable-model-invocation"
-        ],
-        "setup-matt-pocock-skills": [
-          "disable-model-invocation"
-        ],
-        "wait-what": [
-          "disable-model-invocation"
-        ],
-        "handoff": [
-          "argument-hint",
-          "disable-model-invocation"
-        ],
-        "to-tickets": [
-          "disable-model-invocation"
-        ],
-        "ask-matt": [
-          "disable-model-invocation"
-        ],
-        "improve-codebase-architecture": [
-          "disable-model-invocation"
-        ],
-        "to-questionnaire": [
-          "disable-model-invocation"
-        ],
-        "to-spec": [
-          "disable-model-invocation"
-        ],
-        "triage": [
-          "disable-model-invocation"
-        ],
-        "grill-with-docs": [
-          "disable-model-invocation"
-        ],
-        "implement": [
-          "disable-model-invocation"
-        ],
-        "teach": [
-          "argument-hint",
-          "disable-model-invocation"
-        ],
-        "grill-me": [
-          "disable-model-invocation"
-        ]
-      },
-      "strict_codex_validator": "passes media skill; rejects known Claude extension keys in 14 unmodified upstream skills"
-    }
-  }
+  "distribution_version": "0.3.0",
+  "checked_at": "2026-09-20",
+  "platform": "macOS Apple Silicon",
+  "python": "3.12.13",
+  "tests": {
+    "run": 587,
+    "skipped": 0
+  },
+  "skip_reason": null,
+  "media_package_tests": 88,
+  "portable_installer_tests": 10,
+  "clean_archive_setup": true,
+  "serena_mcp": {
+    "tools": 14,
+    "python_symbols_observed": true,
+    "model_calls": 0
+  },
+  "docker_health_and_auth_observed": true,
+  "secrets_in_docker_config": false,
+  "model_calls": 0,
+  "limitations": [
+    "Second physical Mac and first-time OS privilege dialogs not exercised",
+    "Account logins are completed by the owner"
+  ],
+  "lite_install_cache": null
 }

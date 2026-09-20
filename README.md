@@ -1,73 +1,42 @@
-# Olympus Max
+# Olympus Max 0.3.0
 
-**Стартер личной памяти с Hindsight: источники → надёжная очередь → поиск с происхождением.**
-**В комплекте нет личного корпуса, чужих учётных данных или готовой авторизации.**
-**Это переносимый клиентский стартер; развёртывание Hindsight выполняется отдельно.**
+**Переносимая рабочая среда для Mac с Apple Silicon.**
+Расширенная редакция: инструменты разработки и медиа, актуальное ядро Olympus и отдельный Hindsight в Docker.
+В архиве код, 37 навыков и установщик. Свою авторизацию подключаете на новом Mac.
 
-Если нужен вариант без Hindsight, используйте [Olympus Lite](https://github.com/Olympus-llm-wiki/Olympus-Lite).
-
-## Обновление 0.2.0
-
-Добавлены [25 навыков и медиа-навык](docs/skills.md), переносимые инструкции Codex/Claude и проверка состава поставки. Общий `search` теперь объединяет локальные источники и Hindsight с видимым покрытием. [Поиск](docs/search.md).
-
-## Начать
-
-Нужен Python 3.12+ на macOS или Linux. На Windows используйте Linux-среду WSL; нативная Windows не поддержана из-за файловой блокировки ядра. Скачайте этот репозиторий в отдельную папку. Для обычного запуска установка Python-пакетов не нужна.
+Распакуйте архив и откройте **Install.command**. Из Terminal:
 
 ```bash
-python3 starter.py setup --api-url http://127.0.0.1:8888 --bank olympus-max
-python3 max.py status
+bash Install.command
 ```
 
-Setup создаёт пустое состояние вне репозитория и сохраняет только несекретные параметры в git-ignored starter.local.json. Он не подключается к серверу, не создаёт модельных операций и не заимствует настройки другого Olympus из окружения.
-
-Разверните локальный Hindsight и настройте его модельный провайдер по [официальной документации](https://github.com/vectorize-io/hindsight/tree/v0.9.2). Клиент проверен с API **0.9.2**. Используйте отдельный банк и аутентификацию API. Control Plane UI этой версии не включён в стартер: в исходном пилоте обнаруживалась проблема его авторизации.
-
-Передавайте API key только через менеджер секретов в переменную процесса `OLYMPUS_HINDSIGHT_API_KEY`. Ключ не пишется в starter.local.json, README или git. Доступ API и доступ самой модели проверяются раздельно.
+[Установка, состав и подключение сервисов](docs/environment.md).
 
 ```bash
-python3 starter.py doctor --live
+./olympus doctor
+./olympus tool openspec --version
+./olympus tool pyright --version
+./olympus project list
 ```
 
-Doctor выполняет read-only проверку API и банка. Он не удостоверяет доступ выбранной модели или готовность резервной копии.
+Откройте эту папку в Codex или Claude и подтвердите доверие проекту. Serena и
+навыки подключаются к текущей папке. Для другого проекта сначала выберите его
+через [карту проектов](docs/project-workspaces.md); cwd и MCP — разные привязки.
 
-Хуки Codex не включены автоматически. Для подготовленного локального профиля можно получить preview командой `python3 scripts/generate-capture-hooks.py --state-root /absolute/state --sessions-root /absolute/sessions --output /absolute/hooks-preview.json`. Перед активацией проверьте пути, явно зарегистрируйте нужную задачу и используйте штатное доверие Codex к конфигурации хуков. Сгенерированный файл с локальными путями не входит в шаблон.
+Команды памяти доступны через `./olympus memory`. Установщик создаёт новый локальный профиль; управление собственным Docker — через `environment.py runtime`. Внешний Hindsight по-прежнему можно подключить через `starter.py setup`; административные команды клиентского профиля остаются закрыты.
 
-## Первый источник
+Обновление 0.3.0: переносимые devtools вместо абсолютных путей автора, новые
+навыки OpenSpec и Olympus-development, три процедуры ECC, актуальный медиаразбор,
+опциональный ХОВС, общий интерфейс project/workspace и упаковка по manifest.
 
 ```bash
-python3 max.py capture-file /absolute/source.md --source-key source-001 --scope personal --title "Первый источник" --role primary
-python3 max.py grant-budget --operations 1 --minutes 10
-python3 max.py work --limit 1
-python3 max.py status
-python3 max.py recall "Вопрос по источнику" --scope personal
+./olympus extras media
+./olympus tool reel --help
+./olympus extras khvs
+./olympus tool khvs doctor
+python3 scripts/test.py
+python3 scripts/verify-distribution.py
 ```
 
-Между отправкой и готовностью индекса можно повторить work; повтор использует тот же operation ID. Бюджет ограничивает допуск новых документов, а не все расходы сервера или фоновые операции сторонних клиентов. После пилота выполните `python3 max.py pause-models`.
-
-## Состав
-
-| Возможность | Что она даёт |
-|---|---|
-| Полные источники и версии | Проверяемые байты, происхождение, отдельные статусы доставки |
-| Очередь Hindsight | Повторы, операции и контроль приёма документов |
-| Пакеты исследований | Проверка тезисов и цитат без объявления их истинными |
-| Журнал случаев | Наблюдения с основаниями и проверяемые предложения политики |
-| Явный захват задач | Только отдельно зарегистрированные разговоры |
-
-Команды research и learning доступны через `python3 max.py COMMAND --help`. Форматы данных описаны в [спецификациях](openspec/specs/research-evidence/spec.md) и [учебном CLI-пилоте](scripts/evidence-learning-pilot.py). Для локального изолированного испытания:
-
-```bash
-PYTHONPATH=src python3 scripts/evidence-learning-pilot.py --output /absolute/new-pilot-directory
-PYTHONPATH=src python3 -m unittest discover -s tests -q
-```
-
-## Граница стартера
-
-Стартер подключается к **уже настроенному Hindsight**. Он не разворачивает Docker, не переносит OAuth store, не устанавливает фоновые службы и не копирует конфигурацию автора. Управляемые остановка работников, подтверждённое забывание и native backup требуют отдельного операторского runtime. Соответствующие административные команды закрыты в starter entry point, чтобы не применять их к произвольному внешнему серверу.
-
-Обычный capture не равен наличию в Hindsight; готовый индекс не равен удалённой резервной копии. Смысловую работу выполняют агент и настроенная модель. Сохраняйте копию локального состояния и штатный backup Hindsight; эта поставка не объявляет их созданными.
-
-Служебный код ядра сохранён для дальнейшей настройки оператором. В комплект не включены старые материалы Olympus, сторонние платные комплекты, личные пути и значения секретов. [Происхождение исходников](TEMPLATE.json).
-
-Проверка состава: `python3 scripts/verify-distribution.py`. [Как обновлять поставку](docs/updating.md).
+[Навыки](docs/skills.md) · [Медиа](docs/media.md) ·
+[Обновление и упаковка](docs/updating.md) · [Происхождение](TEMPLATE.json).

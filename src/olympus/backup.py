@@ -42,6 +42,13 @@ NATIVE_TABLES = (
 )
 LOCAL_TABLES = {"sources", "versions", "locations", "delivery", "changes", "settings",
                 "registrations", "captured_events", "manifest_integrity", "superseded_content"}
+OPTIONAL_TABLES = {"pipeline_jobs", "local_text_documents", "local_text_dependencies", "local_text_spans", "payload_deletions",
+                   "native_completion_receipts", "native_representations", "native_representation_parts",
+                   "native_retirements",
+                   "local_text_fts", "local_text_fts_data", "local_text_fts_idx", "local_text_fts_content",
+                   "local_text_fts_docsize", "local_text_fts_config"}
+VERSIONED_TABLES = {"pipeline_jobs", "local_text_documents", "payload_deletions",
+                    "native_completion_receipts", "native_representations", "native_retirements"}
 VERSION_FILES = ("original", "text.txt", "manifest.json", "manifest.sha256")
 VERSION_ID = re.compile(r"olv-[a-f0-9]{64}")
 HASH = re.compile(r"[a-f0-9]{64}")
@@ -145,7 +152,7 @@ def _safe_receipt(value: dict, *, require_frozen: bool) -> dict:
     return _json(data)
 
 
-def _copy_regular(source: Path, target: Path) -> dict:
+def _copy_regular(source: Path, target: Path, *, fence=None) -> dict:
     try:
         fd = os.open(source, os.O_RDONLY | os.O_NOFOLLOW)
     except OSError:
@@ -160,6 +167,8 @@ def _copy_regular(source: Path, target: Path) -> dict:
         size = 0
         with os.fdopen(outgoing_fd, "wb") as outgoing:
             for chunk in iter(lambda: incoming.read(1024 * 1024), b""):
+                if fence:
+                    fence()
                 size += len(chunk)
                 if size > MAX_FILE_BYTES:
                     raise CheckpointError("source_too_large")
@@ -283,8 +292,12 @@ def _database(path: Path):
         if len(checks) != 1 or checks[0][0] != "ok":
             raise CheckpointError("local_database_integrity_failed")
         schema = db.execute("SELECT type,name FROM sqlite_master WHERE name NOT LIKE 'sqlite_%'").fetchall()
-        if {row["name"] for row in schema if row["type"] == "table"} != LOCAL_TABLES:
+        tables = {row["name"] for row in schema if row["type"] == "table"}
+        if not LOCAL_TABLES <= tables or tables - LOCAL_TABLES - OPTIONAL_TABLES:
             raise CheckpointError("unsupported_local_schema")
+        for name in tables & VERSIONED_TABLES:
+            if db.execute(f'SELECT 1 FROM "{name}" WHERE schema_version!=1 LIMIT 1').fetchone():
+                raise CheckpointError("unsupported_local_schema")
         if any(row["type"] in ("view", "trigger") for row in schema) or db.execute("PRAGMA foreign_key_check").fetchone():
             raise CheckpointError("local_database_integrity_failed")
         yield db
@@ -297,13 +310,29 @@ def _local_inventory(local: Path) -> dict:
     try:
         with _database(local / "registry.sqlite3") as db:
             versions = [dict(row) for row in db.execute("SELECT id,source_id FROM versions ORDER BY id")]
-            tables = {name: db.execute(f"SELECT count(*) FROM {name}").fetchone()[0] for name in sorted(LOCAL_TABLES)}
+            names = {r[0] for r in db.execute("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'")}
+            tables = {name: db.execute(f'SELECT count(*) FROM "{name}"').fetchone()[0] for name in sorted(names)}
             changes_max_id = db.execute("SELECT coalesce(max(id),0) FROM changes").fetchone()[0]
             for row in versions:
                 if not isinstance(row["id"], str) or not VERSION_ID.fullmatch(row["id"]):
                     raise CheckpointError("invalid_source_version")
-            return {"version_ids": [row["id"] for row in versions], "tables": tables,
-                    "changes_max_id": changes_max_id, "schema": 1}
+            result = {"version_ids": [row["id"] for row in versions], "tables": tables,
+                      "changes_max_id": changes_max_id, "schema": 1}
+            if "payload_deletions" in names:
+                removed = []
+                for row in db.execute("""SELECT p.*,v.active,s.forgotten_at,m.sha256 AS registered_hash
+                    FROM payload_deletions p JOIN versions v ON v.id=p.version_id
+                    JOIN sources s ON s.id=v.source_id JOIN manifest_integrity m ON m.version_id=v.id"""):
+                    receipt = json.loads(row["receipt_json"])
+                    if (row["schema_version"] != 1 or row["active"] or not row["forgotten_at"]
+                            or not row["owner_wording"] or row["manifest_sha256"] != row["registered_hash"]
+                            or receipt.get("state") not in {"planned", "removed"}):
+                        raise CheckpointError("invalid_payload_deletion")
+                    removed.append(row["version_id"])
+                if len(removed) != tables["payload_deletions"]:
+                    raise CheckpointError("invalid_payload_deletion")
+                result["payload_deleted_version_ids"] = sorted(removed)
+            return result
     except CheckpointError:
         raise
     except (sqlite3.Error, OSError, ValueError):
@@ -327,8 +356,13 @@ def _validate_versions(local: Path, inventory: dict) -> None:
                     raise CheckpointError("source_manifest_anchor_mismatch")
                 semantic = {k: manifest[k] for k in ("source_key", "scope", "kind", "title", "metadata")}
                 source_id = "ols-" + hashlib.sha256(canonical([manifest["scope"], manifest["source_key"]])).hexdigest()
-                original_hash = _sha(folder / "original")
-                text_hash = _sha(folder / "text.txt")
+                if version_id in inventory.get("payload_deleted_version_ids", []):
+                    if (folder / "original").exists() or (folder / "text.txt").exists():
+                        raise CheckpointError("deleted_payload_in_checkpoint")
+                    original_hash, text_hash = manifest["original_sha256"], manifest["text_sha256"]
+                else:
+                    original_hash = _sha(folder / "original")
+                    text_hash = _sha(folder / "text.txt")
                 expected = "olv-" + hashlib.sha256(canonical([source_id, original_hash, text_hash, semantic])).hexdigest()
                 row = db.execute("SELECT source_id FROM versions WHERE id=?", (version_id,)).fetchone()
                 if (manifest.get("schema") != 1 or manifest.get("version_id") != version_id
@@ -351,6 +385,10 @@ def _member_name(name: str) -> bool:
     parts = PurePosixPath(name).parts
     return (len(parts) == 4 and parts[:2] == ("local", "versions") and bool(VERSION_ID.fullmatch(parts[2]))
             and parts[3] in VERSION_FILES and str(PurePosixPath(name)) == name)
+
+
+def _version_files(inventory: dict, version_id: str) -> tuple[str, ...]:
+    return ("manifest.json", "manifest.sha256") if version_id in inventory.get("payload_deleted_version_ids", []) else VERSION_FILES
 
 
 def create_checkpoint(store, native_backup: Path, recipient: str, output_dir: Path, *, runtime_receipt: dict) -> dict:
@@ -386,7 +424,7 @@ def create_checkpoint(store, native_backup: Path, recipient: str, output_dir: Pa
                     source_folder = store.versions / version
                     if source_folder.is_symlink() or not source_folder.is_dir():
                         raise CheckpointError("source_version_is_symlink")
-                    for name in VERSION_FILES:
+                    for name in _version_files(inventory, version):
                         member = f"local/versions/{version}/{name}"
                         files[member] = _copy_regular(source_folder / name, staging / member)
                 _validate_versions(staging / "local", inventory)
@@ -572,7 +610,7 @@ def _unpack_verified(plaintext: BinaryIO, staging: Path) -> dict:
             raise CheckpointError("local_inventory_mismatch")
         expected_names = {"local/registry.sqlite3", "native/hindsight.zip"}
         expected_names.update(f"local/versions/{version}/{name}" for version in inventory["version_ids"]
-                              for name in VERSION_FILES)
+                              for name in _version_files(inventory, version))
         if set(files) != expected_names:
             raise CheckpointError("checkpoint_inventory_mismatch")
         _validate_versions(staging / "local", inventory)

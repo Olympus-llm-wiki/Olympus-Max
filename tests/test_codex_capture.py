@@ -67,6 +67,12 @@ class CodexCaptureTests(unittest.TestCase):
         self.assertIn("прежний выбор отменён", result.messages[4].text)
         self.assertEqual(result.messages[-1].phase, "final_answer")
 
+    def test_01534_uses_verified_schema_without_accepting_other_versions(self):
+        self.records[0]["payload"]["cli_version"] = "0.153.4"
+        result = self.parse(self.records, registration=replace(self.registration, codex_version="0.153.4"))
+        self.assertTrue(result.complete)
+        self.assertEqual(result.adapter_version, "0.153.4")
+
     def test_repeat_read_is_stable_without_collapsing_real_repeated_messages(self):
         first = self.parse()
         second = self.parse()
@@ -194,6 +200,29 @@ class CodexCaptureTests(unittest.TestCase):
         self.assertIn("compacted_history_requires_reconciliation", self.codes(result))
         self.assertNotIn("SYNTHETIC_COMPACTED_CONTEXT", export_markdown(result))
         self.assertIn("не является побайтовым оригиналом", export_markdown(result))
+
+    def test_complete_new_turn_after_compaction_has_independent_coverage(self):
+        boundary = {"timestamp": "2026-09-05T10:00:11Z", "type": "compacted",
+                    "payload": {"message": "SYNTHETIC_SUMMARY_NOT_EVIDENCE"}}
+        result = self.parse(self.records + [boundary] + self.next_turn())
+        self.assertIn("compacted_history_requires_reconciliation", self.codes(result))
+        self.assertFalse(result.complete)
+        self.assertIn("next-turn", result.completed_turn_ids)
+        self.assertEqual(len(result.segments), 2)
+        self.assertIn("next-turn", result.segments[1].completed_turn_ids)
+        self.assertNotIn("SYNTHETIC_SUMMARY_NOT_EVIDENCE", export_markdown(result))
+
+    def test_turn_crossing_compaction_is_not_complete(self):
+        boundary = {"timestamp": "2026-09-05T10:00:08Z", "type": "compacted", "payload": {}}
+        result = self.parse(self.records[:11] + [boundary] + self.records[11:] + self.next_turn())
+        self.assertNotIn("synthetic-turn", result.completed_turn_ids)
+        self.assertIn("next-turn", result.completed_turn_ids)
+
+    def test_compaction_requires_new_explicit_turn_start(self):
+        boundary = {"timestamp": "2026-09-05T10:00:11Z", "type": "compacted", "payload": {}}
+        later = [r for r in self.next_turn() if r.get("payload", {}).get("type") != "task_started"]
+        result = self.parse(self.records + [boundary] + later)
+        self.assertNotIn("next-turn", result.completed_turn_ids)
 
     def test_timestamp_and_missing_metadata_errors_fail_visibly(self):
         self.records[6]["timestamp"] = "no time"

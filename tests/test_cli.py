@@ -54,6 +54,26 @@ class CLITests(unittest.TestCase):
         p = self.run_cli("status")
         self.assertEqual(json.loads(p.stdout)["budget"]["remaining"], 0)
 
+    def test_backup_warning_does_not_fail_delivery_service(self):
+        import signal
+        from olympus.jobs import PipelineJobs
+        store = Store(self.state)
+        status = {'backup': {'state': 'waiting_for_disk_space', 'error': 'snapshot_disk_space_low'}}
+        for mode in ('delivery', 'backup'):
+            handlers = {}
+            with patch('olympus.cli.signal.signal', side_effect=lambda number, handler: handlers.update({number: handler})), \
+                 patch('olympus.cli.faulthandler.register'), \
+                 patch('olympus.cli._client', return_value=object()), \
+                 patch('olympus.cli._deliver', return_value={**status, 'delivery': [{'state': 'submitted'}]}), \
+                 patch('olympus.cli._backup', return_value=status), \
+                 patch('olympus.cli.time.sleep', side_effect=lambda _: handlers[signal.SIGTERM](signal.SIGTERM, None)), \
+                 redirect_stdout(io.StringIO()):
+                self.assertEqual(main(['--state', str(self.state), 'daemon', '--mode', mode, '--interval', '5']), 0)
+        jobs = {row['kind']: row for row in PipelineJobs(store).snapshot()}
+        self.assertEqual(jobs['service.delivery']['state'], 'succeeded')
+        self.assertEqual(json.loads(store.setting('issues:delivery')), [])
+        self.assertEqual(json.loads(store.setting('issues:backup'))[0]['error'], 'snapshot_disk_space_low')
+
     def test_recall_timeout_reaches_transport_without_bypassing_scope_filter(self):
         store = Store(self.state)
         receipt = store.capture(source_key="recall", scope="synthetic", title="Recall source",

@@ -68,14 +68,17 @@ def load_input(path: Path, *, limit=MAX_ARTIFACT_BYTES) -> dict:
 
 
 def assert_ready(store: Store, scope: str) -> None:
-    # This uses the existing global recovery/retraction barriers; membership in
-    # the model index is not required to verify a locally preserved original.
-    store.active_documents(scope)
+    # Evidence reads don't need to enumerate the entire retrieval index.
+    # Sources.get checks each referenced source, and the final read guard checks
+    # withdrawals/policy changes. Recovery remains a global safety boundary.
+    if store.setting('recovery_state', 'ready') != 'ready':
+        raise PreservationError('recovery_verification_required')
 
 
 class Sources:
-    def __init__(self, store: Store):
+    def __init__(self, store: Store, *, text_only=False):
         self.store, self.cache, self.bytes = store, {}, 0
+        self.text_only = text_only
 
     def get(self, vid: str) -> dict:
         version_id(vid)
@@ -87,13 +90,18 @@ class Sources:
         if not row or not row["active"] or row["forgotten_at"]:
             raise PreservationError("evidence_version_not_active")
         folder = self.store.versions / vid
+        manifest = self.store.read_manifest(vid)
+        # Record payloads are bounded JSON originals. Retrieval checks quotes
+        # against verified text anchors; the explicit research check still
+        # audits full originals by default.
+        read_original = not self.text_only or manifest.get('metadata', {}).get('artifact_type') in KINDS
         try:
-            size = sum((folder / name).stat().st_size for name in ("original", "text.txt"))
+            size = sum((folder / name).stat().st_size for name in (("original", "text.txt") if read_original else ("text.txt",)))
         except OSError:
             raise PreservationError("evidence_version_unavailable") from None
         if size > MAX_SOURCE_BYTES or self.bytes + size > MAX_CHECK_BYTES:
             raise PreservationError("evidence_check_size_limit")
-        data = self.store.read_version(vid)
+        data = self.store.read_version(vid) if read_original else self.store.read_text_version(vid)
         self.bytes += size
         self.cache[vid] = data
         return data
@@ -308,44 +316,93 @@ def register_package(store: Store, data: dict) -> dict:
         assert_ready(store, data["scope"])
         # Capture precedes citation analysis; even a held package is reviewable.
         receipt = save_record(store, "research_package", data)
-        return {"receipt": receipt, "verification": check_package(store, receipt["version_id"])}
+    return {"receipt": receipt, "verification": check_package(store, receipt["version_id"])}
+
+
+def research_read_guard(store: Store) -> str:
+    """Small SQL-only control snapshot; never reads source files under a lock."""
+    with store.connect() as db:
+        inactive = [r[0] for r in db.execute('SELECT id FROM versions WHERE active=0 ORDER BY id')]
+        forgotten = [tuple(r) for r in db.execute('SELECT id,forgotten_at FROM sources WHERE forgotten_at IS NOT NULL ORDER BY id')]
+        settings = [tuple(r) for r in db.execute('''SELECT key,value FROM settings
+            WHERE key='recovery_state' OR substr(key,1,17)='research_package:'
+            OR substr(key,1,16)='research_policy:' OR substr(key,1,9)='learning_'
+            ORDER BY key''')]
+    return digest(canonical([inactive, forgotten, settings]))
+
+
+class ReportBindings(dict):
+    guard: str
+
+
+def report_bindings_current(store: Store, bindings: dict) -> bool:
+    guard = getattr(bindings, 'guard', None)
+    return guard is None or guard == research_read_guard(store)
 
 
 def check_package(store: Store, vid: str, *, policy: dict | None = None,
-                  require_current=False) -> dict:
+                  require_current=False, retrieval_text_only=False) -> dict:
+    guard = research_read_guard(store)
+    cache = Sources(store, text_only=retrieval_text_only)
+    data, source = read_record(store, vid, "research_package", sources=cache, require_current=require_current)
+    assert_ready(store, data["scope"])
+    if policy is None:
+        # The pure read implementation normally has a coarse lock wrapper.
+        # Here all source reads run outside it; the full control snapshot below
+        # detects revocation, registry replacement and active-policy changes.
+        from .learning import _effective_policy
+        policy = _effective_policy(store, data["scope"])["policy"]
+    result = {**check_manifest(store, data, policy, sources=cache), "package_version": vid}
     with store.exclusive():
-        cache = Sources(store)
-        data, source = read_record(store, vid, "research_package", sources=cache, require_current=require_current)
-        assert_ready(store, data["scope"])
-        if policy is None:
-            from .learning import effective_policy
-            policy = effective_policy(store, data["scope"])["policy"]
-        return {**check_manifest(store, data, policy, sources=cache), "package_version": vid}
+        if guard != research_read_guard(store):
+            raise PreservationError('evidence_snapshot_changed')
+    return result
 
 
 def report_links(store: Store, reports: set[str], scope: str) -> dict[str, list[dict]]:
-    """Caller holds the writer lock across this check and final result shaping."""
-    result = {}
+    """Read outside writer locks; callers recheck the SQL guard before returning."""
+    result = ReportBindings()
+    result.guard = research_read_guard(store)
+    reports = {vid for vid in reports if material_profile(store.read_manifest(vid))['material_role'] == 'synthesis'}
+    if not reports:
+        return result
+    with store.connect() as db:
+        has_dependencies = db.execute("SELECT 1 FROM sqlite_master WHERE name='local_text_dependencies'").fetchone()
+        indexed_reports = {}
+        if has_dependencies:
+            for package, report in db.execute('SELECT DISTINCT package_version,report_version FROM local_text_dependencies'):
+                indexed_reports.setdefault(package, set()).add(report)
     for vid in registry(store, "research_package", scope):
         # Read the immutable manifest first so a withdrawn package can still
         # withhold its known report instead of silently removing the guard.
-        version = store.read_version(vid)
+        known_reports = indexed_reports.get(vid)
+        if known_reports is not None and not reports & known_reports:
+            continue
         try:
+            version = store.read_version(vid)
             data = json.loads(version["original"])
             report = data["report_version"]
-        except (ValueError, KeyError, TypeError):
-            raise PreservationError("invalid_research_registry") from None
+        except (ValueError, KeyError, TypeError, PreservationError):
+            for report in reports & known_reports if known_reports is not None else reports:
+                result.setdefault(report, []).append({'package_version':vid, 'state':'held',
+                    'issue_codes':['invalid_research_registry'], 'semantic_support_verified':False})
+            continue
         if report not in reports:
             continue
         try:
-            checked = check_package(store, vid, require_current=True)
+            checked = check_package(store, vid, require_current=True, retrieval_text_only=True)
             summary = {"package_version": vid, "package_id": data["id"], "state": checked["state"],
                        "verification_sha256": checked["verification_sha256"],
                        "dependency_versions": checked["dependency_versions"],
                        "issue_codes": sorted({x["code"] for x in checked["issues"]}),
                        "semantic_support_verified": False, "coverage": "declared_claims_only"}
+            summary['integrity_check'] = 'verified_text_and_manifest_anchors'
         except PreservationError as exc:
             summary = {"package_version": vid, "state": "held", "issue_codes": [str(exc)],
                        "semantic_support_verified": False}
         result.setdefault(report, []).append(summary)
+    with store.exclusive():
+        if not report_bindings_current(store, result):
+            for report in reports:
+                result.setdefault(report, []).append({'state': 'held', 'issue_codes': ['evidence_snapshot_changed']})
     return result

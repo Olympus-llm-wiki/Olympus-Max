@@ -1,11 +1,14 @@
 {
   "schema": 1,
   "edition": "Olympus-Max",
-  "source_revision": "950da39cb262ac6e9e7674476f499a7dfb857ce7",
+  "source_revision": "c1925c6af06574b39ea5aa512cfaed2c4a862630",
   "source_kind": "owner-maintained implementation",
   "personal_corpus_included": false,
   "personal_credentials_included": false,
-  "distribution_version": "0.2.0",
-  "skills_source_revision": "950da39cb262ac6e9e7674476f499a7dfb857ce7",
-  "skills_count": 26
+  "distribution_version": "0.3.0",
+  "skills_source_revision": "c1925c6af06574b39ea5aa512cfaed2c4a862630",
+  "skills_count": 37,
+  "operating_environment_source_revision": "c1925c6af06574b39ea5aa512cfaed2c4a862630",
+  "operating_environment_target": "macOS Apple Silicon",
+  "ecc_version": "2.2.1"
 }

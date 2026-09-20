@@ -161,8 +161,7 @@ class EvidenceLearningTests(unittest.TestCase):
     def test_retraction_and_recovery_barriers_apply(self):
         package = self.package("withdraw")
         self.store.forget(package["original"].source_id, "Synthetic withdrawal")
-        with self.assertRaisesRegex(PreservationError, "correction_reconciliation_pending"):
-            ev.check_package(self.store, package["version"])
+        self.assertEqual(ev.check_package(self.store, package["version"])["state"], "held")
         self.settle_retraction_for_local_test()
         self.assertEqual(ev.check_package(self.store, package["version"])["state"], "held")
         self.store.set_setting("recovery_state", "blocked")
@@ -197,8 +196,9 @@ class EvidenceLearningTests(unittest.TestCase):
                 self.store.forget(package["original"].source_id, "Synthetic withdrawal during recall")
                 return {"results": [{"document_id": package["report"].version_id}]}
 
-        with self.assertRaisesRegex(PreservationError, "correction_reconciliation_pending"):
-            recall_active(self.store, Client(), "query", self.scope)
+        result = recall_active(self.store, Client(), "query", self.scope)
+        self.assertEqual(result['results'], [])
+        self.assertEqual(result.get('chunks', {}), {})
 
     def test_unregistered_report_keeps_existing_attribution(self):
         source = self.source("Historical report", "synthesis", archive=False)

@@ -149,8 +149,7 @@ class PreservationTests(unittest.TestCase):
         self.store.recover()
         self.assertEqual(self.store.receipt(first.version_id).memory, "forgotten")
         self.assertIsNone(self.store.claim())
-        with self.assertRaisesRegex(PreservationError, "correction_reconciliation_pending"):
-            self.store.active_documents("project-one")
+        self.assertEqual(self.store.active_documents("project-one"), set())
 
     def test_supersession_does_not_apply_to_another_scope(self):
         first = self.capture()

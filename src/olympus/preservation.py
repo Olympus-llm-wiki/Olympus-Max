@@ -267,6 +267,12 @@ class Store:
                     shutil.rmtree(staging)
         saved = self.read_version(version_id)
         self._register(saved, locator=locator)
+        # The derived index is independent: a failure cannot undo durable bytes.
+        try:
+            from .text_index import TextIndex
+            TextIndex(self).put(saved)
+        except (PreservationError, OSError, sqlite3.Error):
+            self.set_setting('text_index_error:' + version_id, 'indexing_pending')
         return self.receipt(version_id)
 
     def read_manifest(self, version_id: str) -> dict:
@@ -294,6 +300,21 @@ class Store:
             return m
         except (OSError, ValueError, KeyError, TypeError):
             raise PreservationError("invalid_source_version") from None
+
+    def read_text_version(self, version_id: str) -> dict:
+        """Verify text and manifest identity without reading the binary original."""
+        m = self.read_manifest(version_id)
+        try:
+            raw = (self.versions / version_id / 'text.txt').read_bytes()
+            semantic = {k: m[k] for k in ('source_key', 'scope', 'kind', 'title', 'metadata')}
+            source_id = 'ols-' + digest(canonical([m['scope'], m['source_key']]))
+            expected = 'olv-' + digest(canonical([source_id, m['original_sha256'], digest(raw), semantic]))
+            if expected != version_id or source_id != m['source_id'] or digest(raw) != m['text_sha256']:
+                raise PreservationError('source_hash_mismatch')
+            guard_no_secrets(raw)
+            return {**m, 'text': raw.decode('utf-8')}
+        except (OSError, ValueError, KeyError, TypeError):
+            raise PreservationError('invalid_source_version') from None
 
     def read_version(self, version_id: str) -> dict:
         m = self.read_manifest(version_id)
@@ -334,12 +355,18 @@ class Store:
                 db.execute("INSERT INTO locations VALUES(?,?,?) ON CONFLICT(source_id,locator) DO UPDATE SET observed_at=excluded.observed_at",
                            (m["source_id"], location, timestamp()))
 
-    def recover(self) -> dict:
+    def recover(self, *, full_verify: bool = True) -> dict:
         recovered, invalid = 0, []
         with self.connect() as db:
             known = {x[0] for x in db.execute("SELECT id FROM versions")}
+            has_deletions = db.execute("SELECT 1 FROM sqlite_master WHERE name='payload_deletions'").fetchone()
+            deleted = {r[0] for r in db.execute('SELECT version_id FROM payload_deletions')} if has_deletions else set()
         for folder in sorted(self.versions.iterdir()):
             if not folder.name.startswith("olv-"):
+                continue
+            if folder.name in deleted:
+                continue
+            if not full_verify and folder.name in known:
                 continue
             try:
                 m = self.read_version(folder.name)
@@ -355,28 +382,59 @@ class Store:
             if row is None:
                 raise PreservationError("unknown_version")
             correction = "pending" if db.execute("SELECT 1 FROM changes WHERE source_id=? AND applied=0 LIMIT 1", (row["source_id"],)).fetchone() else "not_required"
-            return Receipt(row["source_id"], version_id, version_id, row["operation_id"], "durable", row["state"], row["remote_state"], correction)
+            local = 'durable'
+            if db.execute("SELECT 1 FROM sqlite_master WHERE name='payload_deletions'").fetchone():
+                deletion = db.execute('SELECT receipt_json FROM payload_deletions WHERE version_id=?', (version_id,)).fetchone()
+                if deletion:
+                    try:
+                        removal = json.loads(deletion[0])
+                        local = 'removed_by_owner' if removal.get('state') == 'removed' else 'removal_pending'
+                    except (ValueError, TypeError, AttributeError):
+                        raise PreservationError('invalid_payload_deletion_receipt') from None
+            return Receipt(row["source_id"], version_id, version_id, row["operation_id"], local, row["state"], row["remote_state"], correction)
 
-    def claim(self, *, lease_seconds: float = 90, now: float | None = None) -> dict | None:
+    def claim(self, *, lease_seconds: float = 90, now: float | None = None,
+              version_id: str | None = None) -> dict | None:
         now = time.time() if now is None else now
         with self.connect(write=True) as db:
             recovery = db.execute("SELECT value FROM settings WHERE key='recovery_state'").fetchone()
             maintenance = db.execute("SELECT value FROM settings WHERE key='maintenance'").fetchone()
             if (recovery and recovery[0] != "ready") or (maintenance and maintenance[0] != "off"):
                 return None
-            row = db.execute("""SELECT d.*,v.source_id,s.scope FROM delivery d
+            mode = db.execute("SELECT value FROM settings WHERE key='delivery_mode'").fetchone()
+            continuous = bool(mode and mode[0] == "continuous")
+            has_parts = db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='native_representations'").fetchone() is not None
+            represented = ("EXISTS (SELECT 1 FROM native_representations r WHERE r.version_id=v.id AND r.kind='native_index' AND r.enabled=1)"
+                           if has_parts else "0")
+            row = db.execute(f"""SELECT d.*,v.source_id,s.scope FROM delivery d
                 JOIN versions v ON v.id=d.version_id JOIN sources s ON s.id=v.source_id
                 WHERE d.state IN ('pending','submitted') AND d.next_attempt<=? AND d.lease_until<=?
-                AND v.active=1 AND s.forgotten_at IS NULL ORDER BY v.observed_at,d.version_id LIMIT 1""", (now, now)).fetchone()
+                AND (? IS NULL OR v.id=?)
+                AND NOT EXISTS (SELECT 1 FROM settings selected
+                    WHERE selected.key='processing_profile:'||v.id)
+                AND v.active=1 AND s.forgotten_at IS NULL
+                ORDER BY CASE WHEN ? AND (d.state='submitted' OR (d.attempts>0 AND NOT ({represented}))) THEN 0 ELSE 1 END,
+                CASE WHEN ? THEN d.updated_at ELSE v.observed_at END,v.observed_at,d.version_id LIMIT 1""",
+                (now, now, version_id, version_id, continuous, continuous)).fetchone()
             if row is None:
                 return None
             lease_id = str(uuid.uuid4())
             db.execute("UPDATE delivery SET lease_until=?,lease_id=? WHERE version_id=?", (now + lease_seconds, lease_id, row["version_id"]))
             return {**dict(row), "lease_id": lease_id, "lease_until": now + lease_seconds}
 
+    def reserve_delivery_attempt(self, job: dict) -> bool:
+        """Record possible submission before network I/O, including process death."""
+        with self.connect(write=True) as db:
+            return db.execute("""UPDATE delivery SET attempts=attempts+1,updated_at=?
+                WHERE version_id=? AND lease_id=? AND state IN ('pending','submitted') AND lease_until>?
+                AND NOT EXISTS (SELECT 1 FROM settings selected WHERE selected.key='processing_profile:'||delivery.version_id)
+                AND EXISTS (SELECT 1 FROM versions v JOIN sources s ON s.id=v.source_id
+                    WHERE v.id=delivery.version_id AND v.active=1 AND s.forgotten_at IS NULL)""",
+                (timestamp(), job["version_id"], job["lease_id"], time.time())).rowcount == 1
+
     def update_delivery(self, job: dict, state: str, *, error: str | None = None,
                         delay: float = 0, units: int | None = None, attempted: bool = False) -> bool:
-        if state not in {"pending", "submitted", "searchable", "empty", "failed", "blocked", "archived"}:
+        if state not in {"pending", "submitted", "searchable", "empty", "partial", "failed", "blocked", "archived"}:
             raise PreservationError("invalid_delivery_state")
         if error and not re.fullmatch(r"[a-zA-Z0-9_.:-]{1,120}", error):
             raise PreservationError("unsafe_error_code")
@@ -393,28 +451,21 @@ class Store:
             row = db.execute("SELECT active FROM versions WHERE id=?", (version_id,)).fetchone()
             if row is None or not row[0]:
                 raise PreservationError("version_not_active")
-            db.execute("UPDATE delivery SET state='pending',last_error=NULL,next_attempt=0,lease_until=0,lease_id=NULL WHERE version_id=? AND state IN ('failed','blocked','empty')", (version_id,))
+            db.execute("UPDATE delivery SET state='pending',last_error=NULL,next_attempt=0,lease_until=0,lease_id=NULL WHERE version_id=? AND state IN ('failed','blocked','empty','partial')", (version_id,))
 
     def status(self) -> dict:
         with self.connect() as db:
             counts = {row[0]: row[1] for row in db.execute("SELECT state,count(*) FROM delivery GROUP BY state")}
             pending_corrections = db.execute("SELECT count(*) FROM changes WHERE applied=0").fetchone()[0]
-            oldest = db.execute("SELECT min(v.observed_at) FROM versions v JOIN delivery d ON d.version_id=v.id WHERE d.state IN ('pending','submitted','blocked','failed')").fetchone()[0]
+            oldest = db.execute("SELECT min(v.observed_at) FROM versions v JOIN delivery d ON d.version_id=v.id WHERE d.state IN ('pending','submitted','blocked','failed','partial')").fetchone()[0]
             errors = [dict(r) for r in db.execute("SELECT version_id,state,last_error FROM delivery WHERE last_error IS NOT NULL ORDER BY updated_at DESC LIMIT 10")]
             return {"versions": sum(counts.values()), "delivery": counts, "oldest_pending": oldest,
                     "pending_corrections": pending_corrections, "errors": errors,
                     "remote_unconfirmed": db.execute("SELECT count(*) FROM delivery WHERE remote_state='unconfirmed'").fetchone()[0]}
 
     def active_documents(self, scope: str) -> set[str]:
-        with self.connect() as db:
-            recovery = db.execute("SELECT value FROM settings WHERE key='recovery_state'").fetchone()
-            if recovery and recovery[0] != "ready":
-                raise PreservationError("recovery_verification_required")
-            if db.execute("SELECT 1 FROM changes WHERE applied=0 LIMIT 1").fetchone():
-                raise PreservationError("correction_reconciliation_pending")
-            return {r[0] for r in db.execute("""SELECT v.id FROM versions v JOIN sources s ON s.id=v.source_id
-                JOIN delivery d ON d.version_id=v.id WHERE s.scope=? AND s.forgotten_at IS NULL AND v.active=1
-                AND d.state='searchable'""", (scope,))}
+        from .withholding import eligible_versions
+        return set(eligible_versions(self, scope=scope, delivered_only=True))
 
     @serialized
     def forget(self, source_id: str, reason: str) -> int:

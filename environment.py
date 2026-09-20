@@ -1,0 +1,390 @@
+#!/usr/bin/env python3
+"""Portable Olympus tools. All machine-specific files are created on this host."""
+from __future__ import annotations
+import argparse
+import hashlib
+import json
+import io
+import os
+from pathlib import Path
+import platform
+import shutil
+import socket
+import subprocess
+import sys
+import tarfile
+import tempfile
+import time
+import urllib.request
+
+class EnvironmentError(Exception):
+    pass
+
+ROOT = Path(__file__).resolve().parent
+CONFIG = '.olympus-local.json'
+PG = 'pgvector/pgvector:0.8.1-pg17-bookworm@sha256:e117f7e160d2bac88ced018d073944214a558c54e3ebf725fe7f33e232ea05f0'
+HS = 'ghcr.io/vectorize-io/hindsight:0.9.2@sha256:b94369e48294ce2277557553226a7713e2b06791647332090c21169c2ff11fb3'
+MODELS = [('sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2','e8f8c211226b894fcb81acc59f3b34ba3efd5f42'),('cross-encoder/mmarco-mMiniLMv2-L12-H384-v1','1427fd652930e4ba29e8149678df786c240d8825')]
+
+def edition(root):
+    value=json.loads((root/'TEMPLATE.json').read_text())['edition']
+    if value not in ('Olympus-Max','Olympus-Lite'): raise EnvironmentError('unknown_edition')
+    return value
+
+def install_plan(root, *, system=None, machine=None):
+    if (system or platform.system())!='Darwin' or (machine or platform.machine())!='arm64':
+        raise EnvironmentError('macos_apple_silicon_required')
+    e=edition(root)
+    return {'edition':e,'formulae':['uv','node@24','git','ripgrep','tmux','ffmpeg','gh','yt-dlp'],
+            'casks':['codex','claude-code']+(['docker-desktop'] if e=='Olympus-Max' else []),
+            'project_tools':['openspec','pyright','serena'],
+            'manual_connections':['Codex / Claude account','Antigravity account (optional)','application connectors (optional)']}
+
+def tool_env(cfg=None):
+    env=os.environ.copy()
+    env['PATH']='/opt/homebrew/opt/node@24/bin:/opt/homebrew/bin:/Applications/Docker.app/Contents/Resources/bin:'+env.get('PATH','/usr/bin:/bin')
+    env.update(DO_NOT_TRACK='1',OPENSPEC_TELEMETRY='0',OPENSPEC_NO_UPDATE_CHECK='1',OPENSPEC_NO_COMPLETIONS='1',HF_HUB_DISABLE_TELEMETRY='1',HOMEBREW_NO_AUTO_UPDATE='1')
+    if cfg:
+        base=Path(cfg['state'])
+        env['PATH']=str(base/'bin')+os.pathsep+str(Path.home()/'.local/bin')+os.pathsep+env['PATH']
+        env.update(UV_CACHE_DIR=str(base/'cache/uv'),npm_config_cache=str(base/'cache/npm'),
+                   SERENA_HOME=str(base/'serena-home'),XDG_CONFIG_HOME=str(base/'xdg/config'),XDG_DATA_HOME=str(base/'xdg/data'))
+    return env
+
+def command(argv, *, cfg=None, cwd=None, timeout=1800, capture=False, input=None, env=None):
+    try:
+        result=subprocess.run([str(a) for a in argv],cwd=cwd,env=env or tool_env(cfg),input=input,
+                              text=True,stdout=subprocess.PIPE if capture else None,
+                              stderr=subprocess.PIPE if capture else None,timeout=timeout)
+    except (OSError,subprocess.TimeoutExpired) as e:
+        raise EnvironmentError('command_unavailable_or_timed_out:'+Path(str(argv[0])).name) from None
+    if result.returncode: raise EnvironmentError('command_failed:'+Path(str(argv[0])).name+':'+str(result.returncode))
+    return result.stdout.strip() if capture else ''
+
+def _safe_target(path):
+    for parent in [path,*path.parents]:
+        if parent.is_symlink(): raise EnvironmentError('configuration_symlink_refused')
+
+def _write_files(files):
+    # Check all conflicts before writing any configuration.
+    for p,body in files.items():
+        _safe_target(p)
+        if p.exists() and (not p.is_file() or p.read_text()!=body):
+            raise EnvironmentError('existing_configuration_differs:'+p.name)
+    for p,body in files.items():
+        if p.exists(): continue
+        p.parent.mkdir(parents=True,exist_ok=True)
+        with p.open('x') as f: f.write(body)
+        p.chmod(0o600)
+
+def configure(root, *, home=None, python=None, port=None):
+    root=root.resolve(); home=(home or Path.home()).resolve(); e=edition(root)
+    identity=e.lower()+'-'+hashlib.sha256(str(root).encode()).hexdigest()[:12]
+    state=home/'.local/share/olympus-environments'/identity
+    if state.is_relative_to(root): raise EnvironmentError('state_must_be_outside_repository')
+    existing=root/CONFIG
+    cfg={'schema':1,'edition':e,'root':str(root),'id':identity,'state':str(state),
+         'python':python or sys.executable,'port':19888 if port is None else port,'uid':os.getuid(),'gid':os.getgid()}
+    if existing.exists():
+        _safe_target(existing)
+        old=json.loads(existing.read_text())
+        if old['root']!=str(root) or old['state']!=str(state) or old['edition']!=e:
+            raise EnvironmentError('existing_configuration_differs:'+CONFIG)
+        if port is not None and old['port']!=port: raise EnvironmentError('existing_configuration_differs:port')
+        cfg=old
+    if not 1024<=cfg['port']<=65535: raise EnvironmentError('invalid_port')
+    runner=[cfg['python'],str(root/'environment.py'),'tool','serena']
+    codex='''# Generated by Olympus environment.py; native project trust remains required.
+[mcp_servers.olympus_serena]
+command = %s
+args = %s
+cwd = %s
+startup_timeout_sec = 90
+tool_timeout_sec = 60
+disabled_tools = ["activate_project", "write_memory", "read_memory", "delete_memory", "edit_memory", "rename_memory", "list_memories", "onboarding", "check_onboarding_performed"]
+'''%(json.dumps(runner[0]),json.dumps(runner[1:]),json.dumps(str(root)))
+    project={'project_name':identity,'language_servers':['python'],'encoding':'utf-8','ignore_all_files_in_gitignore':True,
+             'read_only':False,'added_modes':['no-memories'],'ignored_paths':['.serena/cache/**','.serena/memories/**'],
+             'ls_specific_settings':{'python':{'pyright_version':'1.1.403','ls_base_cmd':[cfg['python'],str(root/'environment.py'),'tool','pyright-langserver']}}}
+    files={existing:json.dumps(cfg,indent=2)+'\n',root/'.codex/config.toml':codex,
+           root/'.mcp.json':json.dumps({'mcpServers':{'olympus_serena':{'command':runner[0],'args':runner[1:],'cwd':str(root)}}},indent=2)+'\n',
+           root/'.serena/project.yml':json.dumps(project,indent=2)+'\n',
+           state/'serena-home/serena_config.yml':'projects: []\nweb_dashboard: false\nweb_dashboard_open_on_launch: false\ngui_log_window: false\nbase_modes: [interactive, editing, no-memories]\n'}
+    if e=='Olympus-Max' and not (state/'compose.json').exists():
+        files[state/'compose.json']=json.dumps(compose_config(cfg,root),indent=2)+'\n'
+    _write_files(files)
+    for name in ('cache','logs','xdg/config','xdg/data','codex-auth'):
+        (state/name).mkdir(parents=True,exist_ok=True,mode=0o700)
+    return cfg
+
+def ensure_client(root,cfg):
+    if cfg['edition']=='Olympus-Max':
+        command([cfg['python'],str(root/'starter.py'),'setup','--state',str(Path(cfg['state'])/'memory'),
+                 '--api-url','http://127.0.0.1:'+str(cfg['port']),'--bank',cfg['id']],cfg=cfg,capture=True)
+
+
+def load(root):
+    p=root/CONFIG; _safe_target(p)
+    if not p.exists(): raise EnvironmentError('run_install_or_configure_first')
+    cfg=json.loads(p.read_text())
+    if cfg['root']!=str(root.resolve()) or cfg['edition']!=edition(root): raise EnvironmentError('moved_environment_run_fresh_install')
+    return cfg
+
+def compose_config(cfg, root):
+    state=Path(cfg['state'])
+    env={'HINDSIGHT_API_DATABASE_URL':'postgresql://olympus@db:5432/olympus',
+         'HINDSIGHT_API_TENANT_EXTENSION':'hindsight_api.extensions.builtin.tenant:ApiKeyTenantExtension',
+         'HINDSIGHT_API_TENANT_MCP_AUTH_DISABLED':'false','HINDSIGHT_API_SKIP_LLM_VERIFICATION':'true',
+         'HINDSIGHT_API_LLM_PROVIDER':'none','HINDSIGHT_API_LLM_MODEL':'gpt-5.6-terra',
+         'HINDSIGHT_API_RETAIN_LLM_MODEL':'gpt-5.6-luna','HINDSIGHT_API_LLM_MAX_CONCURRENT':'1',
+         'HINDSIGHT_API_LLM_MAX_RETRIES':'0','HINDSIGHT_API_WORKER_MAX_SLOTS':'1','HINDSIGHT_API_WORKER_CONSOLIDATION_RESERVED_SLOTS':'0',
+         'HINDSIGHT_API_LOG_LEVEL':'warning',
+         'HINDSIGHT_API_ENABLE_OBSERVATIONS':'false','HINDSIGHT_API_WORKER_ENABLED':'false',
+         'HINDSIGHT_API_STORE_DOCUMENT_TEXT':'true','HINDSIGHT_API_TEXT_SEARCH_EXTENSION':'native',
+         'HINDSIGHT_API_TEXT_SEARCH_EXTENSION_NATIVE_LANGUAGE':'simple',
+         'HINDSIGHT_API_EMBEDDINGS_PROVIDER':'local','HINDSIGHT_API_EMBEDDINGS_LOCAL_FORCE_CPU':'true',
+         'HINDSIGHT_API_RERANKER_PROVIDER':'local','HINDSIGHT_API_RERANKER_LOCAL_FORCE_CPU':'true',
+         'HF_HOME':'/home/hindsight/.cache/huggingface','HF_HUB_OFFLINE':'1','HF_HUB_DISABLE_TELEMETRY':'1',
+         'HOME':'/home/hindsight','CODEX_HOME':'/home/hindsight/olympus-codex-auth',
+         'TORCHINDUCTOR_CACHE_DIR':'/tmp/olympus-torch','DO_NOT_TRACK':'1','OTEL_SDK_DISABLED':'true',
+         'TOKENIZERS_PARALLELISM':'false','OMP_NUM_THREADS':'2',
+         'HINDSIGHT_API_LLM_TRACE_ENABLED':'false','HINDSIGHT_API_LLM_DEBUG_DUMP_4XX':'false'}
+    for var,(repo,revision) in zip(('HINDSIGHT_API_EMBEDDINGS_LOCAL_MODEL','HINDSIGHT_API_RERANKER_LOCAL_MODEL'),MODELS):
+        env[var]='/home/hindsight/.cache/huggingface/hub/models--'+repo.replace('/','--')+'/snapshots/'+revision
+    base={'image':HS,'platform':'linux/arm64','user':str(cfg['uid'])+':'+str(cfg['gid']),
+          'entrypoint':['/bin/bash','/opt/olympus/runtime-entrypoint.sh'],'restart':'no',
+          'environment':env,'stop_grace_period':'40s','networks':['database','egress'],
+          'volumes':['models:/home/hindsight/.cache/huggingface',
+                     {'type':'bind','source':str(state/'codex-auth'),'target':'/home/hindsight/olympus-codex-auth','bind':{'create_host_path':False}},
+                     *[{'type':'bind','source':str(root/'runtime'/name),'target':'/opt/olympus/'+name,'read_only':True,'bind':{'create_host_path':False}} for name in ('runtime-entrypoint.sh','runtime-services.py','model_proxy.py')]],
+          'tmpfs':['/run/olympus:mode=0700,uid='+str(cfg['uid'])+',gid='+str(cfg['gid'])+',size=64k'],
+          'depends_on':{'db':{'condition':'service_healthy'}},'mem_limit':'4g','cpus':2}
+    api={**base,'ports':['127.0.0.1:'+str(cfg['port'])+':8888'],'command':['api']}
+    worker={**base,'command':['worker'],'environment':{**env,'HINDSIGHT_API_WORKER_ID':cfg['id']+'-worker'}}
+    return {'name':cfg['id'],'services':{'db':{'image':PG,'platform':'linux/arm64','restart':'no',
+             'environment':{'POSTGRES_USER':'olympus','POSTGRES_DB':'olympus','POSTGRES_HOST_AUTH_METHOD':'trust'},
+             'volumes':['postgres:/var/lib/postgresql/data'],'networks':['database'],
+             'healthcheck':{'test':['CMD-SHELL','pg_isready -U olympus -d olympus'],'interval':'5s','timeout':'3s','retries':12}},
+             'hindsight':api,'worker':worker},'volumes':{'postgres':{},'models':{}},'networks':{'database':{'internal':True},'egress':{}}}
+
+def compose(cfg):
+    return ['docker','compose','--project-name',cfg['id'],'--file',str(Path(cfg['state'])/'compose.json')]
+
+def verify(root):
+    return command([sys.executable,str(root/'scripts/verify-distribution.py')],cwd=root,capture=True,timeout=60)
+
+def install(root, *, core_only=False, port=None):
+    plan=install_plan(root)
+    verify(root)
+    brew=shutil.which('brew',path=tool_env()['PATH'])
+    if not brew: raise EnvironmentError('homebrew_missing_run_Install.command')
+    needed={'uv':'uv','node@24':'node','git':'git','ripgrep':'rg','tmux':'tmux','ffmpeg':'ffmpeg','gh':'gh','yt-dlp':'yt-dlp'}
+    for formula,binary in needed.items():
+        if not shutil.which(binary,path=tool_env()['PATH']): command([brew,'install',formula])
+    if not core_only:
+        for cask in plan['casks']:
+            binary={'codex':'codex','claude-code':'claude','docker-desktop':'docker'}[cask]
+            if not shutil.which(binary,path=tool_env()['PATH']): command([brew,'install','--cask',cask])
+    cfg=configure(root,port=port)
+    ensure_client(root,cfg)
+    base=Path(cfg['state']); deps=json.loads((root/'config/toolchain.json').read_text())
+    if not (base/'python/bin/python').exists():
+        command(['uv','venv','--python','3.12',str(base/'python')],cfg=cfg)
+    npm=base/'npm'; npm.mkdir(exist_ok=True)
+    for name in ('package.json','package-lock.json'): shutil.copyfile(root/'config'/name,npm/name)
+    command(['npm','ci','--ignore-scripts','--no-audit','--no-fund'],cfg=cfg,cwd=npm)
+    serena=deps['serena']; source=base/'serena'/('serena-'+serena['commit'])
+    source.parent.mkdir(exist_ok=True)
+    if not source.exists():
+        archive=base/'serena-source.tar.gz'
+        with urllib.request.urlopen(serena['source_url'],timeout=60) as response:
+            raw=response.read(32*1024*1024+1)
+        if len(raw)>32*1024*1024 or hashlib.sha256(raw).hexdigest()!=serena['archive_sha256']:
+            raise EnvironmentError('serena_source_hash_mismatch')
+        archive.write_bytes(raw)
+        with tarfile.open(archive) as package:
+            prefix='serena-'+serena['commit']
+            if any(m.name!=prefix and not m.name.startswith(prefix+'/') for m in package.getmembers()):
+                raise EnvironmentError('unexpected_serena_archive_layout')
+            package.extractall(source.parent,filter='data')
+    if hashlib.sha256((source/'uv.lock').read_bytes()).hexdigest()!=serena['uv_lock_sha256']:
+        raise EnvironmentError('serena_lock_hash_mismatch')
+    command(['uv','sync','--frozen','--no-dev','--no-default-groups','--python',str(base/'python/bin/python')],cfg=cfg,cwd=source)
+    (base/'installed.json').write_text(json.dumps({'schema':1,'toolchain_sha256':hashlib.sha256((root/'config/toolchain.json').read_bytes()).hexdigest(),'installed_at':time.time()})+'\n')
+    if cfg['edition']=='Olympus-Max' and not core_only:
+        try:
+            command(['docker','info','--format','{{.ServerVersion}}'],cfg=cfg,capture=True,timeout=10)
+        except EnvironmentError:
+            if Path('/Applications/Docker.app').exists():
+                command(['open','-a','Docker'],cfg=cfg,timeout=10)
+            print('Завершите первый запуск Docker Desktop; затем повторите Install.command.',flush=True)
+        else:
+            runtime(root,'prepare')
+            if os.environ.get('OLYMPUS_HINDSIGHT_API_KEY'): runtime(root,'start')
+            else: print('Docker подготовлен. Для запуска доставьте OLYMPUS_HINDSIGHT_API_KEY из менеджера секретов.',flush=True)
+    print(json.dumps(doctor(root),ensure_ascii=False,indent=2))
+    return 0
+
+def tool_command(root,cfg,name,args):
+    base=Path(cfg['state'])
+    if name in ('openspec','pyright','pyright-langserver'):
+        return [str(base/'npm/node_modules/.bin'/name),*args]
+    if name=='serena':
+        commit=json.loads((root/'config/toolchain.json').read_text())['serena']['commit']
+        return [str(base/'serena'/('serena-'+commit)/'.venv/bin/serena'),'start-mcp-server',
+                '--project',str(root),'--context',str(root/'config/serena-context.yml'),'--add-mode','no-memories',
+                '--enable-web-dashboard','false','--open-web-dashboard','false','--enable-gui-log-window','false',*args]
+    if name=='reel': return ['uv','run','--frozen','--project',str(root/'packages/reel-analysis'),'reel',*args]
+    if name=='media': return [cfg['python'],str(root/'.agents/skills/local-media-mining/scripts/media.py'),*args]
+    if name=='yt-dlp': return ['yt-dlp','--ignore-config','--no-plugin-dirs',*args]
+    if name=='khvs': return [str(base/'python/bin/python'),'-m','olympus.khvs',*args]
+    if name in ('codex','claude','git','gh','rg','ffmpeg','ffprobe','tmux','uv','node','agy'): return [name,*args]
+    raise EnvironmentError('unknown_tool')
+
+def install_antigravity(root,cfg):
+    if shutil.which('agy',path=tool_env(cfg)['PATH']): return
+    install_plan(root)
+    manifest=json.loads((root/'config/antigravity.json').read_text())
+    with urllib.request.urlopen(manifest['url'],timeout=180) as response:
+        data=response.read(256*1024*1024+1)
+    if len(data)>256*1024*1024 or hashlib.sha512(data).hexdigest()!=manifest['sha512']:
+        raise EnvironmentError('antigravity_download_checksum_mismatch')
+    with tarfile.open(fileobj=io.BytesIO(data),mode='r:gz') as archive:
+        member=archive.getmember('antigravity')
+        if not member.isfile() or member.size>256*1024*1024:raise EnvironmentError('antigravity_invalid_binary')
+        binary=archive.extractfile(member).read()
+    target=Path(cfg['state'])/'bin/agy';_safe_target(target)
+    target.parent.mkdir(exist_ok=True)
+    with target.open('xb') as f:f.write(binary)
+    target.chmod(0o755)
+
+
+def doctor(root):
+    report={'edition':edition(root),'platform':platform.system()+'/'+platform.machine(),'configuration':'missing','tools':{},'connections':{},'runtime':'not_required'}
+    cfg=load(root) if (root/CONFIG).exists() else None
+    if cfg: report['configuration']='ready'
+    for name,args in [('uv',['--version']),('node',['--version']),('git',['--version']),('rg',['--version']),('tmux',['-V']),('gh',['--version']),('ffmpeg',['-version']),('ffprobe',['-version']),('codex',['--version']),('claude',['--version']),('agy',['--version'])]:
+        try: report['tools'][name]={'state':'available','version':command([name,*args],cfg=cfg,capture=True,timeout=10).splitlines()[0][:160]}
+        except EnvironmentError: report['tools'][name]={'state':'missing_or_unavailable'}
+    for name in ('openspec','pyright'):
+        try:
+            if not cfg: raise EnvironmentError('not_configured')
+            report['tools'][name]={'state':'available','version':command(tool_command(root,cfg,name,['--version']),cfg=cfg,capture=True,timeout=15).splitlines()[0][:160]}
+        except EnvironmentError: report['tools'][name]={'state':'not_installed'}
+    try:
+        if not cfg: raise EnvironmentError('not_configured')
+        serena=Path(tool_command(root,cfg,'serena',[])[0])
+        report['tools']['serena']={'state':'available' if serena.is_file() else 'not_installed','mcp_handshake':'not_tested'}
+    except EnvironmentError: report['tools']['serena']={'state':'not_installed'}
+    report['tools_ready']=all(report['tools'][name]['state']=='available' for name in ('uv','node','git','rg','tmux','gh','ffmpeg','openspec','pyright','serena'))
+    report['connections']={'codex':'login_not_tested','claude':'login_not_tested','antigravity':'login_not_tested','plugins':'connect_in_agent_on_this_device'}
+    if edition(root)=='Olympus-Max':
+        try:
+            command(['docker','info','--format','{{.ServerVersion}}'],cfg=cfg,capture=True,timeout=10)
+            report['runtime']='docker_available'
+        except EnvironmentError: report['runtime']='docker_start_or_install_required'
+        report['connections']['hindsight_key']='available_in_process' if os.environ.get('OLYMPUS_HINDSIGHT_API_KEY') else 'secret_manager_connection_required'
+    return report
+
+def runtime(root,action):
+    cfg=load(root)
+    if cfg['edition']!='Olympus-Max': raise EnvironmentError('runtime_only_in_max')
+    base=Path(cfg['state']); cli=compose(cfg)
+    if action=='status':
+        command([*cli,'ps'],cfg=cfg); return 0
+    if action=='stop':
+        command([*cli,'stop'],cfg=cfg); return 0
+    if action=='prepare':
+        endpoint=command(['docker','context','inspect','--format','{{.Endpoints.docker.Host}}'],cfg=cfg,capture=True)
+        with tempfile.TemporaryDirectory(prefix='olympus-public-images-') as directory:
+            (Path(directory)/'config.json').write_text('{"auths":{}}')
+            for image in (PG,HS):
+                try: command(['docker','image','inspect',image,'--format','{{.Id}}'],cfg=cfg,capture=True,timeout=10)
+                except EnvironmentError:
+                    command(['docker','--config',directory,'--host',endpoint,'pull','--platform','linux/arm64',image],cfg=cfg)
+
+        if (base/'models-ready.json').exists() and json.loads((base/'models-ready.json').read_text()).get('models')==[list(m) for m in MODELS]:
+            probe='import os; assert all(os.path.isdir(os.environ[k]) for k in ("HINDSIGHT_API_EMBEDDINGS_LOCAL_MODEL","HINDSIGHT_API_RERANKER_LOCAL_MODEL"))'
+            try:
+                command([*cli,'run','--rm','--no-deps','--entrypoint','python','hindsight','-c',probe],cfg=cfg,capture=True,timeout=30)
+                print('Pinned models already prepared for this environment.'); return 0
+            except EnvironmentError: pass
+        code='from huggingface_hub import snapshot_download\nimport os\n'
+        code+='for repo,revision in '+repr(MODELS)+':\n snapshot_download(repo,revision=revision,allow_patterns=["*.json","*.txt","*.model","model.safetensors"],ignore_patterns=["onnx/*","openvino/*"],max_workers=2)\n'
+        code+='for directory,dirs,files in os.walk(os.environ["HF_HOME"]):\n os.chown(directory,'+str(cfg['uid'])+','+str(cfg['gid'])+')\n for name in dirs+files: os.chown(os.path.join(directory,name),'+str(cfg['uid'])+','+str(cfg['gid'])+')\n'
+        command([*cli,'run','--rm','--no-deps','--user','root','-e','HF_HUB_OFFLINE=0','--entrypoint','python','hindsight','-c',code],cfg=cfg,timeout=3600)
+        (base/'models-ready.json').write_text(json.dumps({'models':MODELS})+'\n')
+        return 0
+    if action=='login':
+        # Only an explicit owner action invokes the native login. Never reuse host auth.
+        command([*cli,'run','--rm','--no-deps','--entrypoint','codex','worker','login','--device-auth'],cfg=cfg)
+        return 0
+    if action not in ('start','enable-models'): raise EnvironmentError('unknown_runtime_action')
+    key=os.environ.get('OLYMPUS_HINDSIGHT_API_KEY','')
+    if not key: raise EnvironmentError('deliver_OLYMPUS_HINDSIGHT_API_KEY_from_secret_manager')
+    if not (base/'models-ready.json').exists(): raise EnvironmentError('run_runtime_prepare_first')
+    if action=='enable-models' and not (base/'codex-auth/auth.json').is_file(): raise EnvironmentError('run_runtime_login_first')
+    # Refuse an occupied port unless it is already published by this exact Compose project.
+    running=command([*cli,'ps','--services','--status','running'],cfg=cfg,capture=True)
+    if 'hindsight' not in running.splitlines():
+        with socket.socket() as sock:
+            try: sock.bind(('127.0.0.1',cfg['port']))
+            except OSError: raise EnvironmentError('runtime_port_in_use_choose_install_port') from None
+    spec=compose_config(cfg,root)
+    if action=='enable-models':
+        env=spec['services']['worker']['environment']
+        env.update(HINDSIGHT_API_LLM_PROVIDER='openai-codex',HINDSIGHT_API_WORKER_ENABLED='true',HINDSIGHT_API_ENABLE_OBSERVATIONS='true')
+    (base/'compose.json').write_text(json.dumps(spec,indent=2)+'\n')
+    command([*cli,'up','-d','--pull','never','--force-recreate','hindsight','worker'],cfg=cfg)
+    for service in ('hindsight','worker'):
+        program='for i in $(seq 1 80); do [ -p /run/olympus/api-key.pipe ] && exec sh -c "cat > /run/olympus/api-key.pipe"; sleep 0.25; done; exit 1'
+        command([*cli,'exec','-T',service,'sh','-c',program],cfg=cfg,input=key+'\n',capture=True,timeout=30)
+    from urllib.error import URLError
+    healthy=False
+    for _ in range(90):
+        try:
+            with urllib.request.urlopen('http://127.0.0.1:'+str(cfg['port'])+'/health',timeout=2) as response:
+                if response.status==200: healthy=True; break
+        except (URLError,OSError): pass
+        time.sleep(2)
+    if not healthy: raise EnvironmentError('runtime_health_timeout')
+    print(json.dumps({'runtime':'healthy','models':'enabled' if action=='enable-models' else 'paused','port':cfg['port']}))
+    return 0
+
+def main(argv=None):
+    parser=argparse.ArgumentParser(description='Olympus: установка и инструменты рабочей среды')
+    sub=parser.add_subparsers(dest='command',required=True)
+    sub.add_parser('plan');sub.add_parser('doctor');sub.add_parser('verify')
+    p=sub.add_parser('configure');p.add_argument('--port',type=int)
+    p=sub.add_parser('install');p.add_argument('--core-only',action='store_true');p.add_argument('--port',type=int)
+    p=sub.add_parser('tool');p.add_argument('name');p.add_argument('args',nargs=argparse.REMAINDER)
+    p=sub.add_parser('runtime');p.add_argument('action',choices=['prepare','start','status','stop','login','enable-models'])
+    p=sub.add_parser('extras');p.add_argument('name',choices=['khvs','media'])
+    args=parser.parse_args(argv)
+    try:
+        if args.command=='plan': result=install_plan(ROOT)
+        elif args.command=='configure':
+            result=configure(ROOT,port=args.port)
+            ensure_client(ROOT,result)
+        elif args.command=='doctor': result=doctor(ROOT)
+        elif args.command=='verify': print(verify(ROOT));return 0
+        elif args.command=='install': return install(ROOT,core_only=args.core_only,port=args.port)
+        elif args.command=='runtime': return runtime(ROOT,args.action)
+        elif args.command=='extras':
+            cfg=load(ROOT); python=Path(cfg['state'])/'python/bin/python'
+            if args.name=='media':
+                install_antigravity(ROOT,cfg)
+                command(['uv','sync','--frozen','--project',str(ROOT/'packages/reel-analysis'),'--no-dev','--python',str(python)],cfg=cfg)
+            else:
+                command(['uv','pip','install','--python',str(python),'-r',str(ROOT/'config/khvs-requirements.txt')],cfg=cfg)
+            return 0
+        else:
+            cfg=load(ROOT);argv=tool_command(ROOT,cfg,args.name,args.args);env=tool_env(cfg)
+            env['PYTHONPATH']=str(ROOT/'src')
+            env['OLYMPUS_STATE_DIR']=str(Path(cfg['state'])/'operations')
+            os.execvpe(argv[0],argv,env)
+        print(json.dumps(result,ensure_ascii=False,indent=2));return 0
+    except (EnvironmentError,ValueError,KeyError,OSError) as e:
+        print(json.dumps({'state':'action_required','reason':str(e) if isinstance(e,EnvironmentError) else 'configuration_or_io_error'},ensure_ascii=False));return 2
+
+if __name__=='__main__':raise SystemExit(main())

@@ -11,3 +11,10 @@ starter.local.json
 state/
 library/
 .DS_Store
+.olympus-local.json
+.mcp.json
+.codex/
+.serena/
+node_modules/
+*.sqlite3*
+.pytest_cache/

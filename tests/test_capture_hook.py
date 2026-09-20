@@ -10,7 +10,7 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
-from olympus.preservation import Store
+from olympus.preservation import Store, PreservationError
 
 PROJECT = Path(__file__).resolve().parents[1]
 SCRIPT = PROJECT / "scripts/codex-capture-hook.py"
@@ -63,7 +63,7 @@ class CaptureHookTests(unittest.TestCase):
 
     def drain(self, **kwargs):
         return hook.drain_signals(state_root=self.state, project_root=self.project,
-                                  sessions_root=self.sessions, **kwargs)
+                                  sessions_root=self.sessions, metadata_reader=kwargs.pop("metadata_reader", lambda *_: None), **kwargs)
 
     def registration(self):
         with Store(self.state).connect() as db:
@@ -86,6 +86,10 @@ class CaptureHookTests(unittest.TestCase):
             result = self.receive(payload, received_at="2026-09-05T13:00:00Z")
             self.assertEqual(result["status"], "already_registered")
             self.assertEqual(self.registration()["started_at"], self.start)
+        events=[json.loads(line) for line in (self.state/'hook-signals/events'/f'{THREAD}.jsonl').read_text().splitlines()]
+        self.assertEqual([e['source']for e in events if e['event']=='SessionStart'],['startup','resume','compact'])
+        self.assertTrue(all(e['registration_boundary']==self.start for e in events))
+        self.assertTrue(all(e['body_saved'] is False for e in events))
 
     def test_first_stop_uses_first_signal_time_without_backfilling_history(self):
         self.receive(self.payload("Stop"))
@@ -100,6 +104,94 @@ class CaptureHookTests(unittest.TestCase):
         result = self.receive(self.payload("Stop"), received_at="2026-09-05T12:00:00Z")
         self.assertEqual(result["status"], "registered")
         self.assertEqual(self.registration()["started_at"], self.start)
+
+    def test_supported_new_version_registers_and_preserves_pending_boundary(self):
+        self.receive(self.payload(transcript_path=None))
+        self.header(cli_version="0.153.4")
+        result = self.receive(self.payload("Stop"), received_at="2026-09-05T12:00:00Z")
+        self.assertEqual(result["status"], "registered")
+        self.assertEqual(self.registration()["started_at"], self.start)
+        self.assertEqual(self.registration()["codex_version"], "0.153.4")
+
+    def test_drain_resolves_only_signalled_id_using_native_metadata(self):
+        self.receive(self.payload(transcript_path=None))
+        calls = []
+        def reader(identity, project):
+            calls.append((identity, project))
+            return {"transcript_path": str(self.path), "codex_version": "0.153.1"}
+        result = self.drain(metadata_reader=reader)
+        self.assertEqual(calls, [(THREAD, self.project)])
+        self.assertEqual(result["registered"], 1)
+        self.assertEqual(result["pending_total"], 0)
+        self.assertEqual(self.registration()["started_at"], self.start)
+
+    def test_drain_missing_path_has_count_age_and_reason(self):
+        self.receive(self.payload(transcript_path=None))
+        result = self.drain()
+        self.assertEqual(result["pending_total"], 1)
+        self.assertGreaterEqual(result["oldest_pending_age_seconds"], 0)
+        self.assertEqual(result["pending_details"][0]["reason"], "transcript_path_missing")
+
+    def test_unloaded_old_signals_back_off_without_starving_new_signal(self):
+        identities=[f'019abcde-0000-7000-8000-{i:012d}' for i in range(1,5)]
+        for identity in identities:
+            self.receive(self.payload(session_id=identity,transcript_path=None))
+        self.header(id=identities[-1])
+        calls=[]
+        def reader(identity, project):
+            calls.append(identity)
+            if identity != identities[-1]:
+                raise PreservationError('codex_metadata_thread_not_loaded')
+            return {'transcript_path':str(self.path),'codex_version':'0.153.1'}
+        with patch.object(hook.time,'time',return_value=100):
+            for _ in identities:
+                self.drain(limit=1,metadata_reader=reader)
+            count=len(calls)
+            for _ in identities:
+                self.drain(limit=1,metadata_reader=reader)
+            self.assertEqual(len(calls),count)
+        with Store(self.state).connect() as db:
+            self.assertIsNotNone(db.execute('SELECT 1 FROM registrations WHERE thread_id=?',(identities[-1],)).fetchone())
+        self.assertEqual(calls,identities)
+        record=json.loads(Store(self.state).setting('hook_attempt:'+identities[0]))
+        self.assertEqual(record['attempts'],1)
+        self.assertEqual(record['next_attempt'],160)
+
+    def test_proven_out_of_project_signal_is_held_without_reading_history(self):
+        self.receive(self.payload(transcript_path=None))
+        def reader(*_):raise PreservationError('codex_metadata_project_mismatch')
+        result=self.drain(metadata_reader=reader)
+        self.assertEqual(result['held_total'],1)
+        self.assertEqual(result['pending_total'],0)
+        held=json.loads(next((self.state/'hook-signals/held').glob('*.json')).read_text())
+        self.assertEqual(held['signal']['thread_id'],THREAD)
+        self.assertEqual(held['signal']['started_at'],self.start)
+        self.assertFalse(held['history_read'])
+        self.assertIsNone(self.registration())
+        self.drain(metadata_reader=lambda *_:self.fail('terminal signal was retried'))
+
+    def test_native_confirmed_resume_path_preserves_first_registration(self):
+        self.receive()
+        resumed=self.sessions/('rollout-resumed-'+THREAD+'.jsonl')
+        resumed.write_bytes(self.path.read_bytes())
+        with self.assertRaisesRegex(hook.HookError,'existing_registration_mismatch'):
+            self.receive(self.payload('Stop',transcript_path=str(resumed)),received_at='2026-09-05T12:00:00Z')
+        result=self.drain(metadata_reader=lambda *_:{'transcript_path':str(resumed),'codex_version':'0.153.1'})
+        self.assertEqual(result['registered'],1)
+        self.assertEqual(self.registration()['transcript_path'],str(resumed))
+        self.assertEqual(self.registration()['started_at'],self.start)
+        self.assertEqual(Store(self.state).status()['versions'],0)
+
+    def test_explicit_current_registration_does_not_backfill_or_slide_boundary(self):
+        reader = lambda *_: {"transcript_path": str(self.path), "codex_version": "0.153.1"}
+        with patch.object(hook, "_now", return_value="2026-09-05T13:00:00+00:00"):
+            first = hook.register_current_task(THREAD, state_root=self.state, project_root=self.project,
+                sessions_root=self.sessions, metadata_reader=reader)
+        second = hook.register_current_task(THREAD, state_root=self.state, project_root=self.project,
+            sessions_root=self.sessions, metadata_reader=reader)
+        self.assertEqual(first["started_at"], "2026-09-05T13:00:00+00:00")
+        self.assertEqual(first["started_at"], second["started_at"])
+        self.assertFalse(first["turn_capture_confirmed"])
 
     def test_missing_or_partial_header_is_pending_and_daemon_can_finish(self):
         for partial in (False, True):
@@ -204,13 +296,9 @@ raise SystemExit(module.main(sys.argv[2:]))
         self.assertEqual(result["registered"], 1)
 
     def test_project_hook_config_uses_only_native_events_and_synchronous_small_timeout(self):
-        output = self.state.parent / "hooks-preview.json"
-        generated = subprocess.run([sys.executable, str(PROJECT / "scripts/generate-capture-hooks.py"),
-            "--state-root", str(self.state), "--sessions-root", str(self.sessions), "--output", str(output)],
-            capture_output=True, text=True, timeout=10)
-        self.assertEqual(generated.returncode, 0, generated.stderr)
-        self.assertFalse(json.loads(generated.stdout)["activated"])
-        config = json.loads(output.read_text())
+        preview = self.state / "hooks-preview.json"
+        subprocess.run([sys.executable, str(PROJECT / "scripts/generate-capture-hooks.py"), "--state-root", str(self.state), "--sessions-root", str(self.sessions), "--output", str(preview)], check=True, capture_output=True)
+        config = json.loads(preview.read_text())
         self.assertEqual(set(config["hooks"]), {"SessionStart", "Stop"})
         for groups in config["hooks"].values():
             for group in groups:

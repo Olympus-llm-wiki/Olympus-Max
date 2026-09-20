@@ -1,0 +1,10 @@
+{
+  "name": "olympus-devtools",
+  "private": true,
+  "version": "1.0.0",
+  "dependencies": {
+    "@fission-ai/openspec": "1.12.0",
+    "@vectorize-io/hindsight-coding-agents": "0.5.1",
+    "pyright": "1.1.403"
+  }
+}

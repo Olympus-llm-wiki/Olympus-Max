@@ -1,0 +1,6 @@
+interface:
+  display_name: "Разработка Olympus + ECC"
+  short_description: "Продолжение разработки с ECC и памятью Olympus"
+  default_prompt: "Используй $olympus-development, чтобы продолжить разработку проекта по актуальному checkpoint Olympus."
+policy:
+  allow_implicit_invocation: true

@@ -113,3 +113,86 @@ def verify_remote_backup(store: Store, filename: str, remote: RemoteFile, *, fol
         with store.connect(write=True) as db:
             _save(db, "backup_remote:" + filename, proof)
         return proof
+
+
+def _snapshot_created(store: Store, checkpoint_id: str) -> dict:
+    if not re.fullmatch(r"[a-f0-9-]{36}", checkpoint_id):
+        raise PreservationError("snapshot_id_invalid")
+    value = json.loads(store.setting("snapshot_created:" + checkpoint_id, "{}"))
+    if not value or digest(canonical(value.get("receipt"))) != value.get("receipt_sha256"):
+        raise PreservationError("snapshot_creation_receipt_required")
+    return value
+
+
+def verify_remote_snapshot_envelope(store: Store, checkpoint_id: str, remote: RemoteFile, *, folder_id: str) -> dict:
+    """Verify the discovery envelope as well as its encrypted manifest object."""
+    created = _snapshot_created(store, checkpoint_id)
+    proof = _file_proof(remote, canonical(created["receipt"]), folder_id)
+    result = {"schema": 2, "checkpoint_id": checkpoint_id, "checked_at": timestamp(), "file": proof}
+    with store.connect(write=True) as db:
+        _save(db, "snapshot_envelope_remote:" + checkpoint_id, result)
+    return result
+
+
+def verify_remote_snapshot_object(store: Store, checkpoint_id: str, object_id: str,
+                                  remote: RemoteFile, *, folder_id: str) -> dict:
+    """Persist one complete authenticated object; callers may release downloads.
+
+    Each object is bounded to 32 MiB. No global writer lock spans file reads; the
+    immutable creation receipt binds the object ID, size and snapshot generation.
+    """
+    from .snapshot_objects import _object_path, MAX_OBJECT_BYTES
+    created = _snapshot_created(store, checkpoint_id)
+    expected = next((obj for obj in created["receipt"]["objects"] if obj["id"] == object_id), None)
+    if not expected or expected["size"] > MAX_OBJECT_BYTES:
+        raise PreservationError("snapshot_object_not_in_manifest")
+    local = _object_path(Path(created["object_root"]), object_id)
+    if local.stat().st_size != expected["size"]:
+        raise PreservationError("snapshot_local_object_mismatch")
+    content = local.read_bytes()
+    if digest(content) != object_id:
+        raise PreservationError("snapshot_local_object_mismatch")
+    proof = _file_proof(remote, content, folder_id)
+    result = {"schema": 2, "checkpoint_id": checkpoint_id, "object_id": object_id,
+              "creation_sha256": created["receipt_sha256"], "checked_at": timestamp(), "file": proof}
+    with store.connect(write=True) as db:
+        _save(db, "snapshot_object_remote:" + checkpoint_id + ":" + object_id, result)
+        _save(db, "snapshot_object_remote_global:" + object_id, result)
+    return result
+
+
+def finish_remote_snapshot(store: Store, checkpoint_id: str) -> dict:
+    """Aggregate durable object proofs without retaining downloaded payloads."""
+    created = _snapshot_created(store, checkpoint_id)
+    with store.connect(write=True) as db:
+        row = db.execute("SELECT value FROM settings WHERE key=?", ("snapshot_envelope_remote:" + checkpoint_id,)).fetchone()
+        if not row:
+            raise PreservationError("snapshot_remote_envelope_missing")
+        envelope = json.loads(row[0])
+        if envelope["file"]["sha256"] != created["receipt_sha256"]:
+            raise PreservationError("snapshot_remote_envelope_mismatch")
+        files = [envelope["file"]]
+        reused = 0
+        for expected in created["receipt"]["objects"]:
+            row = db.execute("SELECT value FROM settings WHERE key=?", ("snapshot_object_remote:" + checkpoint_id + ":" + expected["id"],)).fetchone()
+            specific = row is not None
+            if row is None:
+                row = db.execute("SELECT value FROM settings WHERE key=?", ("snapshot_object_remote_global:" + expected["id"],)).fetchone()
+                reused += row is not None
+            if not row:
+                raise PreservationError("snapshot_remote_objects_incomplete")
+            proof = json.loads(row[0])
+            if ((specific and proof.get("creation_sha256") != created["receipt_sha256"])
+                    or proof.get("object_id") != expected["id"]
+                    or proof["file"]["sha256"] != expected["id"] or proof["file"]["bytes"] != expected["size"]):
+                raise PreservationError("snapshot_remote_object_mismatch")
+            files.append(proof["file"])
+        if len({f["drive_id"] for f in files}) != len(files):
+            raise PreservationError("remote_duplicate_file_id")
+        result = {"schema": 2, "checkpoint_id": checkpoint_id, "checked_at": timestamp(),
+                  "creation_sha256": created["receipt_sha256"], "objects": len(files) - 1,
+                  "remote_state": "verified", "restore_verified": False,
+                  "transport": "verified_immutable_objects", "envelope": envelope["file"],
+                  "reused_object_proofs": reused, "oldest_fetched_at": min(f["fetched_at"] for f in files)}
+        _save(db, "snapshot_remote:" + checkpoint_id, result)
+    return result

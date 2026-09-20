@@ -20,6 +20,9 @@ import stat
 from typing import Callable, Literal
 
 CODEX_VERSION = "0.153.1"
+# 0.153.4 ThreadRead, HooksList and RawResponseItem schemas were compared with
+# 0.153.1; live header validation and parser fixtures remain mandatory.
+SUPPORTED_CODEX_VERSIONS = frozenset({"0.153.1", "0.153.4"})
 MAX_ROLLOUT_BYTES = 128 * 1024 * 1024
 Redactor = Callable[[str], str]
 _CURRENT_TURN = object()
@@ -65,6 +68,15 @@ class CapturedMessage:
 
 
 @dataclass(frozen=True)
+class CoverageSegment:
+    start_record: int
+    end_record: int
+    boundary: str
+    completed_turn_ids: tuple[str, ...] = ()
+    gaps: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
 class CaptureBatch:
     thread_id: str
     messages: tuple[CapturedMessage, ...] = ()
@@ -76,6 +88,7 @@ class CaptureBatch:
     adapter_version: str = CODEX_VERSION
     completed_turn_ids: tuple[str, ...] = ()
     closed_turn_ids: tuple[str, ...] = ()
+    segments: tuple[CoverageSegment, ...] = ()
 
     @property
     def complete(self) -> bool:
@@ -123,7 +136,7 @@ def read_registered_rollout(
     """
     if not callable(redactor):
         raise TypeError("redactor_required")
-    if registration.codex_version != CODEX_VERSION:
+    if registration.codex_version not in SUPPORTED_CODEX_VERSIONS:
         return _failure(registration, "unsupported_codex_version")
     path = Path(registration.transcript_path)
     # No directory walks, globbing, thread DB reads, or resolution by basename.
@@ -149,7 +162,8 @@ def read_registered_rollout(
 
 
 def _failure(registration: CaptureRegistration, code: str) -> CaptureBatch:
-    return CaptureBatch(thread_id=registration.thread_id, gaps=(CoverageGap(code),))
+    return CaptureBatch(thread_id=registration.thread_id, gaps=(CoverageGap(code),),
+                        adapter_version=registration.codex_version)
 
 
 # Known duplicate display events and non-content lifecycle/telemetry. Their
@@ -193,7 +207,7 @@ def parse_rollout(
         raise TypeError("redactor_required")
     if not isinstance(data, bytes):
         raise TypeError("rollout_bytes_required")
-    if registration.codex_version != CODEX_VERSION:
+    if registration.codex_version not in SUPPORTED_CODEX_VERSIONS:
         return _failure(registration, "unsupported_codex_version")
     if len(data) > MAX_ROLLOUT_BYTES:
         return _failure(registration, "transcript_size_limit")
@@ -213,6 +227,9 @@ def parse_rollout(
     current_turn: str | None = None
     record_turn: str | None = None
     blocked_turns: set[str] = set()
+    started_turns: set[str] = set()
+    turn_segments: dict[str, int] = {}
+    segments = [{"start_record": 1, "boundary": "registration", "gaps": set()}]
     global_gap = False
     metadata_seen = False
     last_timestamp: datetime | None = None
@@ -227,7 +244,7 @@ def parse_rollout(
             "invalid_json_line", "invalid_record", "invalid_record_ordinal",
             "duplicate_session_metadata", "record_before_session_metadata",
             "missing_session_metadata", "invalid_timestamp", "timestamp_regression",
-            "missing_turn_id", "compacted_history_requires_reconciliation",
+            "missing_turn_id",
         }
         affected = None if global_code else (record_turn if turn_id is _CURRENT_TURN else turn_id)
         safe_turn = None
@@ -243,6 +260,7 @@ def parse_rollout(
                 global_gap = True
                 safe_turn = None
         gaps.append(CoverageGap(code, line, safe_turn))
+        segments[-1]["gaps"].add(code)
 
     def content_text(content: object, line: int) -> str | None:
         if isinstance(content, str):
@@ -339,7 +357,7 @@ def parse_rollout(
                 gap("unknown_record_field", line)
             if payload.get("id") != registration.thread_id:
                 return _failure(registration, "thread_id_mismatch")
-            if payload.get("cli_version") != CODEX_VERSION:
+            if payload.get("cli_version") != registration.codex_version:
                 return _failure(registration, "unsupported_transcript_version")
             if metadata_seen:
                 gap("duplicate_session_metadata", line)
@@ -372,6 +390,13 @@ def parse_rollout(
             excluded["turn_context"] += 1
             continue
         if observed < start:
+            # Establish turn identity without importing text before the consent
+            # boundary. Completeness describes only the registered text slice.
+            if record_type == "event_msg" and payload.get("type") == "task_started":
+                value = payload.get("turn_id")
+                if isinstance(value, str) and value:
+                    started_turns.add(value)
+                    turn_segments[value] = 0
             excluded["before_registration"] += 1
             continue
 
@@ -385,6 +410,8 @@ def parse_rollout(
                     current_turn = value
                     record_turn = value
                     open_turns.add(value)
+                    started_turns.add(value)
+                    turn_segments[value] = len(segments) - 1
                 else:
                     gap("missing_turn_id", line)
             elif event_type in ("task_complete", "turn_aborted"):
@@ -420,7 +447,16 @@ def parse_rollout(
         if record_type == "compacted":
             # Never export compacted/replacement model context as user evidence.
             excluded["compacted_context"] += 1
-            gap("compacted_history_requires_reconciliation", line)
+            # The historical gap remains visible, but cannot invalidate a later
+            # fully observed turn. A turn spanning this boundary is never complete.
+            blocked_turns.update(open_turns)
+            if current_turn:
+                blocked_turns.add(current_turn)
+            code = "compacted_history_requires_reconciliation"
+            gaps.append(CoverageGap(code, line))
+            segments[-1]["gaps"].add(code)
+            segments[-1]["end_record"] = line
+            segments.append({"start_record": line + 1, "boundary": "compaction", "gaps": set()})
             continue
         if record_type != "response_item":
             gap("unknown_record_type", line)
@@ -541,6 +577,8 @@ def parse_rollout(
         gap("tool_event_without_response_output", turn_id=tool_event_ids[call_id])
     for turn_id in open_turns | (observed_turns - closed_turns):
         gap("turn_incomplete", turn_id=turn_id)
+    for turn_id in observed_turns - started_turns:
+        gap("turn_start_not_observed", turn_id=turn_id)
     for turn_id, _, _ in mirror_events - response_messages:
         gap("display_message_without_response_item", turn_id=turn_id)
     if partial:
@@ -556,14 +594,25 @@ def parse_rollout(
         except Exception:
             gap("redaction_rejected", turn_id=turn_id)
     safe_completed = () if global_gap else tuple(
-        safe_closed[turn_id] for turn_id in sorted(closed_turns - blocked_turns)
+        safe_closed[turn_id] for turn_id in sorted((closed_turns & started_turns) - blocked_turns)
         if turn_id in safe_closed
     )
+    completed_set = set(safe_completed)
+    segment_coverage = tuple(CoverageSegment(
+        start_record=segment["start_record"], end_record=segment.get("end_record", len(lines)),
+        boundary=segment["boundary"],
+        completed_turn_ids=tuple(safe_closed[t] for t in sorted(turn_segments)
+                                 if turn_segments[t] == index and t in safe_closed
+                                 and safe_closed[t] in completed_set),
+        gaps=tuple(sorted(segment["gaps"])),
+    ) for index, segment in enumerate(segments))
     return CaptureBatch(
         thread_id=registration.thread_id, messages=tuple(messages), gaps=tuple(gaps),
         excluded=dict(excluded), source_sha256=hashlib.sha256(data).hexdigest(),
         bytes_read=len(data), trailing_partial=partial,
         completed_turn_ids=safe_completed, closed_turn_ids=tuple(safe_closed.values()),
+        segments=segment_coverage,
+        adapter_version=registration.codex_version,
     )
 
 

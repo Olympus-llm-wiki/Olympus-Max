@@ -22,9 +22,10 @@ class NativeContractDouble:
         self.recall_data = {"results": []}
 
     def operation(self, operation_id):
-        return {"status": self.ops.get(operation_id, "not_found")}
+        state = self.ops.get(operation_id, "not_found")
+        return {"status": state, **({"extraction_errors_count": 0} if state == "completed" else {})}
 
-    def verify_document(self, document_id, expected):
+    def verify_document(self, document_id, expected, *, expected_text=None):
         row = self.documents.get(document_id)
         if row is None:
             return {"exists": False, "searchable": False}
@@ -153,9 +154,39 @@ class DeliveryTests(unittest.TestCase):
         self.assertEqual(len(self.client.submits), 1)
         self.assertEqual(self.client.submits[0]["operation_id"], self.receipt.operation_id)
 
-    def test_expired_operation_history_uses_exact_document_proof(self):
+    def test_expired_operation_history_requires_durable_completion_proof(self):
         self.client.documents[self.receipt.version_id] = ("BLUE-731", 2)
+        self.assertEqual(run_one(self.store, self.client)["state"], "blocked")
+        self.assertEqual(self.store.status()["errors"][0]["last_error"], "document_without_completion_proof")
+        self.assertEqual(self.client.submits, [])
+
+    def test_expired_operation_history_can_reuse_prior_terminal_receipt(self):
+        self.client.documents[self.receipt.version_id] = ("BLUE-731", 2)
+        self.client.ops[self.receipt.operation_id] = "completed"
         self.assertEqual(run_one(self.store, self.client)["state"], "searchable")
+        with self.store.connect(write=True) as db:
+            db.execute("UPDATE delivery SET state='pending',next_attempt=0")
+        del self.client.ops[self.receipt.operation_id]
+        self.assertEqual(run_one(self.store, self.client)["state"], "searchable")
+        self.assertEqual(self.client.submits, [])
+
+    def test_existing_searchable_audit_never_submits_or_invents_missing_history(self):
+        from olympus.native_proof import audit_existing_completion, completion_readiness, profile_fingerprint
+        with self.store.connect(write=True) as db:
+            db.execute("UPDATE delivery SET state='searchable'")
+        self.client.documents[self.receipt.version_id] = ("BLUE-731", 2)
+        result = audit_existing_completion(self.store, self.client, persist=True)
+        self.assertEqual(result["results"][0]["state"], "unknown")
+        self.assertEqual(self.client.submits, [])
+        self.assertEqual(self.store.receipt(self.receipt.version_id).memory, "searchable")
+        self.client.ops[self.receipt.operation_id] = "completed"
+        result = audit_existing_completion(self.store, self.client, persist=True)
+        self.assertTrue(result["results"][0]["receipt_persisted"])
+        self.assertEqual(result["results"][0]["profile_evidence"], "request_only")
+        proof = completion_readiness(self.store, version_id=self.receipt.version_id, document_id=self.receipt.version_id,
+            operation_id=self.receipt.operation_id, text_sha256=digest(b"BLUE-731"), profile=profile_fingerprint())
+        self.assertEqual(proof["state"], "native_complete")
+        self.assertFalse(proof["enrichment_verified"])
         self.assertEqual(self.client.submits, [])
 
     def test_completed_zero_units_is_visible_failure(self):
@@ -183,6 +214,7 @@ class DeliveryTests(unittest.TestCase):
 
     def test_scope_filter_excludes_unregistered_and_derived_results(self):
         self.client.documents[self.receipt.version_id] = ("BLUE-731", 1)
+        self.client.ops[self.receipt.operation_id] = "completed"
         run_one(self.store, self.client)
         self.client.recall_data = {"results": [{"document_id": self.receipt.version_id, "text": "yes"},
                                                {"document_id": "legacy", "text": "no"}, {"text": "unattributed observation"}]}
@@ -192,6 +224,7 @@ class DeliveryTests(unittest.TestCase):
 
     def test_native_chunks_are_filtered_via_allowed_units(self):
         self.client.documents[self.receipt.version_id] = ("BLUE-731", 1)
+        self.client.ops[self.receipt.operation_id] = "completed"
         run_one(self.store, self.client)
         self.client.recall_data = {
             "results": [{"document_id": self.receipt.version_id, "chunk_id": "good"},
@@ -204,14 +237,15 @@ class DeliveryTests(unittest.TestCase):
 
     def test_forget_during_recall_blocks_the_result(self):
         self.client.documents[self.receipt.version_id] = ("BLUE-731", 1)
+        self.client.ops[self.receipt.operation_id] = "completed"
         run_one(self.store, self.client)
         def recall(query, tags):
             self.store.forget(self.receipt.source_id, "Owner withdrawal during request")
             return {"results": [{"document_id": self.receipt.version_id}]}
         self.client.recall = recall
         from olympus.preservation import PreservationError
-        with self.assertRaisesRegex(PreservationError, "correction_reconciliation_pending"):
-            recall_active(self.store, self.client, "code?", "scope-one")
+        result = recall_active(self.store, self.client, "code?", "scope-one")
+        self.assertEqual(result["results"], [])
 
 
 if __name__ == "__main__":

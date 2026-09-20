@@ -6,7 +6,8 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
-from olympus.library import export_versions, scan_notes
+from olympus.library import export_versions, scan_notes, repair_original_names
+from olympus.bounded_io import FileUnavailable
 from olympus.preservation import Store, PreservationError, digest
 
 
@@ -74,6 +75,138 @@ class LibraryTests(unittest.TestCase):
         after = path.stat()
         self.assertEqual(result["already_present"], 1)
         self.assertEqual((before.st_ino, before.st_mtime_ns), (after.st_ino, after.st_mtime_ns))
+
+    def test_idle_export_uses_receipt_but_explicit_audit_reads_originals(self):
+        self.capture()
+        export_versions(self.store, self.library)
+        with patch.object(self.store, "read_version", side_effect=AssertionError("idle loop reread originals")):
+            result = export_versions(self.store, self.library)
+        self.assertEqual(result["cached"], 1)
+        from olympus.library import hash_file
+        with patch("olympus.library.hash_file", wraps=hash_file) as read:
+            result = export_versions(self.store, self.library, audit=True)
+        self.assertEqual(sum(str(call.args[0]).startswith(str(self.store.versions)) for call in read.call_args_list), 2)
+        self.assertFalse(result["errors"])
+
+    def test_timeout_on_one_cloud_file_does_not_block_next_version(self):
+        from olympus.library import _same_file
+        first = self.capture(text="First version")
+        second = self.capture(text="Second version")
+        export_versions(self.store, self.library)
+        def unavailable(path, expected):
+            if first.version_id in str(path):
+                raise FileUnavailable("file_read_timeout")
+            return _same_file(path, expected)
+        with patch("olympus.library._same_file", side_effect=unavailable):
+            result = export_versions(self.store, self.library, audit=True)
+        self.assertEqual(result["already_present"], 1)
+        self.assertEqual(result["errors"], [{"version_id": first.version_id, "code": "file_read_timeout"}])
+        self.assertEqual(json.loads(self.store.setting("drive_staged:" + second.version_id))["status"], "local_staged")
+        self.assertEqual(json.loads(self.store.setting("drive_staged:" + first.version_id))["status"], "materialization_pending")
+
+    def test_guard_policy_change_invalidates_unchanged_export_receipt(self):
+        self.capture()
+        export_versions(self.store, self.library)
+        from olympus.library import guard_no_secrets
+        def updated_guard(data):
+            if data == b"original \x00 bytes":
+                raise PreservationError("credential_pattern_detected")
+            return guard_no_secrets(data)
+        with patch("olympus.library._guard_policy", return_value="new-policy"), patch("olympus.library.guard_no_secrets", side_effect=updated_guard):
+            result = export_versions(self.store, self.library)
+        self.assertEqual(result["errors"][0]["code"], "credential_pattern_detected")
+
+    def test_large_copy_checkpoints_without_loading_parent_original_and_allows_next_source(self):
+        from olympus.library import copy_window
+        large = self.capture(source_key="large", original=b"A" * (2 * 1024**2), text="Small extracted text")
+        small = self.capture(source_key="small", text="Next small source")
+        def limited(source, target, *, offset=0, **kwargs):
+            return copy_window(source, target, offset=offset, window_bytes=512 * 1024)
+        with patch.object(self.store, "read_version", side_effect=AssertionError("parent original read")), \
+             patch("olympus.library.copy_window", side_effect=limited):
+            first = export_versions(self.store, self.library)
+            self.assertTrue(any(e["code"] == "library_copy_pending" for e in first["pending"]))
+            self.assertEqual(json.loads(self.store.setting("drive_staged:" + small.version_id))["status"], "local_staged")
+            for _ in range(4):
+                export_versions(self.store, self.library)
+        self.assertEqual(json.loads(self.store.setting("drive_staged:" + large.version_id))["status"], "local_staged")
+        target = self.library / "Corpus" / large.source_id / large.version_id / "original"
+        self.assertEqual(target.stat().st_size, 2 * 1024**2)
+        self.assertEqual(digest(target.read_bytes()), digest(b"A" * (2 * 1024**2)))
+
+    def test_hot_resume_does_not_wait_for_full_corpus_sweep_or_skip_new_items(self):
+        large = self.capture(source_key="large-hot", original=b"A" * (2 * 1024**2), text="hot text")
+        for index in range(8):
+            self.capture(source_key=f"small-{index}", text=f"Small source {index}")
+        self.store.set_setting("drive_staged:" + large.version_id, json.dumps({"status": "in_progress", "last_attempt_at": 0}))
+        from olympus.library import copy_window
+        def limited(source, target, *, offset=0, **kwargs):
+            return copy_window(source, target, offset=offset, window_bytes=512 * 1024)
+        results = []
+        with patch("olympus.library.copy_window", side_effect=limited):
+            for _ in range(4):
+                results.append(export_versions(self.store, self.library, limit=2))
+        self.assertEqual(json.loads(self.store.setting("drive_staged:" + large.version_id))["status"], "local_staged")
+        self.assertTrue(all(r["checked"] <= 2 for r in results))
+        self.assertEqual(sum(r["hot_resumed"] for r in results), 4)
+        self.assertGreater(sum(r["exported"] for r in results), 1)
+
+    def test_lost_lease_after_first_file_does_not_publish_manifest_or_cursor(self):
+        receipt = self.capture()
+        lost = False
+        real_link = os.link
+        def interrupt_after_file(source, target, **kwargs):
+            nonlocal lost
+            result = real_link(source, target, **kwargs)
+            lost = True
+            return result
+        def fence(_):
+            if lost:
+                raise PreservationError("stage_lease_lost")
+        with patch("olympus.library.os.link", side_effect=interrupt_after_file):
+            with self.assertRaisesRegex(PreservationError, "stage_lease_lost"):
+                export_versions(self.store, self.library, progress=fence)
+        folder = self.library / "Corpus" / receipt.source_id / receipt.version_id
+        self.assertTrue((folder / "original").exists())
+        self.assertFalse((folder / "manifest.json").exists())
+        self.assertIsNone(self.store.setting("drive_staged:" + receipt.version_id))
+
+    def test_pending_observed_alias_does_not_block_verified_canonical_files(self):
+        from olympus.library import hash_file
+        receipt = self.capture()
+        export_versions(self.store, self.library)
+        folder = self.library / "Corpus" / receipt.source_id / receipt.version_id
+        (folder / "original").rename(folder / "original.pdf")
+        def unavailable(path, **kwargs):
+            if Path(path).suffix == ".pdf":
+                raise FileUnavailable("materialization_pending")
+            return hash_file(path, **kwargs)
+        with patch("olympus.library.hash_file", side_effect=unavailable):
+            repaired = repair_original_names(self.store, self.library, [receipt.version_id], preserve_unverified_aliases=True)
+        self.assertEqual(len(repaired["aliases_pending"]), 1)
+        result = export_versions(self.store, self.library)
+        self.assertFalse(result["errors"])
+        self.assertEqual(result["warnings"][0]["code"], "library_alias_verification_pending")
+        (folder / "unknown.txt").write_text("Unexpected owner bytes")
+        self.assertEqual(export_versions(self.store, self.library)["errors"][0]["code"], "library_unexpected_version_files")
+
+    def test_name_repair_preserves_verified_aliases_and_rejects_different_bytes(self):
+        receipt = self.capture()
+        export_versions(self.store, self.library)
+        folder = self.library / "Corpus" / receipt.source_id / receipt.version_id
+        (folder / "original").rename(folder / "original.pdf")
+        (folder / "original (1).pdf").write_bytes(b"different owner bytes")
+        result = repair_original_names(self.store, self.library, [receipt.version_id])
+        self.assertEqual(result["errors"][0]["code"], "library_alias_bytes_conflict")
+        self.assertFalse((folder / "original").exists())
+        (folder / "original (1).pdf").write_bytes((folder / "original.pdf").read_bytes())
+        result = repair_original_names(self.store, self.library, [receipt.version_id])
+        self.assertEqual(result["repaired"], [receipt.version_id])
+        self.assertEqual(result["deleted"], 0)
+        self.assertTrue((folder / "original.pdf").exists())
+        self.assertTrue((folder / "original (1).pdf").exists())
+        self.assertFalse(export_versions(self.store, self.library)["errors"])
+        self.assertFalse(repair_original_names(self.store, self.library, [receipt.version_id])["errors"])
 
     def test_export_conflict_preserves_existing_bytes_and_revokes_local_staging_claim(self):
         receipt = self.capture()

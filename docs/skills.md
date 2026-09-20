@@ -1,9 +1,18 @@
-# Навыки агента
+# Навыки рабочей среды
 
-В checkout включены 25 навыков [Matt Pocock](https://github.com/mattpocock/skills/tree/3cca18b368ae95cdbdebbff572ccafa662551015) (commit от 04.09.2026, проверен 07.09.2026) и собственный [медиа-навык](media.md). Полный состав и SHA-256 upstream находятся в [manifest](../config/matt-pocock-skills.json), лицензия — [MIT](../licenses/matt-pocock-skills-MIT.txt). Файлы 25 навыков сохранены без изменений; проектные адаптации находятся в [docs/agents](agents/domain.md).
+В выпуске 37 навыков: 25 Matt Pocock, 6 OpenSpec, local-media-mining,
+olympus-development, khvs и 3 ECC (tdd-workflow, verification-loop, coding-standards).
+Происхождение и версии — [TEMPLATE](../TEMPLATE.json); полный состав и hashes —
+[DISTRIBUTION](../DISTRIBUTION.json). Upstream Matt сохранён по
+[закреплённому manifest](../config/matt-pocock-skills.json).
 
-Открой репозиторий в Codex: навыки доступны через `.agents/skills`. Для Claude Code `.claude/skills` — относительный указатель на тот же каталог, а CLAUDE.md ведёт к AGENTS.md. Если среда распаковала symlink как текст, восстанови указатель либо скопируй каталог в `.claude/skills`, не меняя пользовательские настройки. [OpenAI Docs](https://learn.chatgpt.com/docs/build-skills) и [Claude Code Docs](https://code.claude.com/docs/en/skills) проверены 07.09.2026; дата публикации страниц не указана. Это подключение к текущему проекту; личная библиотека остаётся отдельно и передаётся агенту явным путём.
+Codex читает `.agents/skills`; Claude — относительную ссылку `.claude/skills`.
+Привязка MCP создаётся установщиком, native trust подтверждает владелец.
+Навыки доступны для выбора, их наличие не запускает процессы и не выдаёт доступ
+к аккаунтам. Маршрут [инженерной работы](../.agents/skills/olympus-development/SKILL.md)
+использует `ops.py` обеих редакций. Для медиа устанавливаются optional dependencies
+через `environment.py extras media`, для ХОВС — `extras khvs`.
 
-Для выбора процедуры — `/ask-matt`; для проверки идеи — `/grill-me`; для диагностики — `/diagnosing-bugs`; для проверки изменений — `/code-review`; для медиа — `$local-media-mining`. Доступность команды и форма вызова зависят от выбранного агента. Наличие файлов не означает проверку всех сценариев навыков. Некоторые процедуры требуют дополнительных инструментов; устанавливай их только для выбранной задачи.
-
-Навыки не дают новых разрешений на внешние действия, не активируют старые решения и не заменяют инструкции владельца. Для планов и задач используются существующие [адаптеры OpenSpec](agents/issue-tracker.md), для памяти — CLI своей редакции. Они не переписывают глобальные навыки и не запускают модели при открытии checkout.
+Лицензии: [Matt MIT](../licenses/matt-pocock-skills-MIT.txt), [ECC MIT](../licenses/ecc-MIT.txt).
+Проверка OpenAI Docs от 20.09.2026: [project configuration](https://learn.chatgpt.com/docs/config-file/config-reference).
+Дата публикации страницы не указана; MCP загружается после доверия проекту.

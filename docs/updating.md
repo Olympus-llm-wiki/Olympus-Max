@@ -1,22 +1,24 @@
-# Обновление поставки
+# Обновление и упаковка
 
-Версия поставки 0.2.0 от 07.09.2026. [TEMPLATE.json](../TEMPLATE.json) различает версию runtime и источник навыков; [DISTRIBUTION.json](../DISTRIBUTION.json) фиксирует hashes файлов. Это снимок конструктора, а не автоматически обновляемый fork.
+Выпуск 0.3.0 переносит операционную среду. Источник и версии компонентов указаны
+в [TEMPLATE](../TEMPLATE.json) и [toolchain](../config/toolchain.json).
+Изменения общего установщика выполняются в конструкторе, в
+`packages/portable-environment`, затем `sync-distributions.py` обновляет выбранные
+чистые checkout редакций. Этот шаг требует ревью Git diff; настройки владельца
+и личный корпус никогда не являются входом сборки.
 
-## Перед обновлением
-
-Проверь чистоту рабочего дерева и текущую удалённую main. Сравни исходную версию в TEMPLATE.json с нужным коммитом конструктора через git log/diff. Переноси конкретные функции с тестами и документацией, сохраняя профиль этой редакции. Личные каталоги, sources, настройки и ключи остаются вне поставки.
-
-Для 25 upstream-навыков сверяй весь состав с [manifest](../config/matt-pocock-skills.json) и сохраняй [лицензию](../licenses/matt-pocock-skills-MIT.txt). Правки для проекта находятся в docs/agents. Для медиа сравни runner, reader и boundary по хешам, а инструкции захвата адаптируй к CLI редакции.
-
-## Проверить checkout
+Перед выпуском проверьте изменения, добавьте только выбранные файлы в Git index:
 
 ```bash
-PYTHONPATH=src python3 -m unittest discover -s tests -q
+python3 scripts/refresh-distribution.py
 python3 scripts/verify-distribution.py
+python3 scripts/test.py
+python3 scripts/package-release.py --output /absolute/Olympus-release.tar.gz
 ```
 
-Verifier не требует Git, сети или модели. Он проверяет файлы manifest, весь состав `.agents/skills` и относительный указатель Claude. Ошибка сообщает changed/missing/unexpected_skill_file. Python bytecode cache исключён; полноценная установка дополнительных инструментов не проверяется.
-
-После осознанных правок обнови TEMPLATE.json, VERIFICATION.json и hashes в DISTRIBUTION.json. Manifest включает все файлы релиза кроме самого manifest, квитанции VERIFICATION.json и служебного symlink (он проверяется отдельно). Используй только подготовленный git index, а не личное состояние или случайные файлы рабочего каталога; сравни полный список перед сохранением хешей. Сам manifest не является криптографической подписью и не подтверждает смысловую правильность навыков.
-
-После проверок создай commit, отправь его без force в выбранную ветку и прочитай её SHA через GitHub API. Локальный origin/main может быть устаревшим; совпадение source_revision с прошлым релизом не означает свежесть источника. Сохраняй прежнюю видимость репозитория. Формат личного хранилища этим выпуском не меняется; откат кода — через revert релизного коммита.
+Refresh откажется при несовпадении index и рабочих файлов, либо при личных файлах
+в index. Архив содержит только manifest и перечисленные в нём файлы. После
+распаковки в новой папке повторите verifier и Install.command. Нельзя переносить
+`.olympus-local.json`, `.codex`, `.mcp.json`, `.serena`, starter.local.json, venv
+или cache другого Mac. Существующую настроенную установку обновляйте в новой
+папке: конфликт конфигурации не обходится удалением чужих файлов.

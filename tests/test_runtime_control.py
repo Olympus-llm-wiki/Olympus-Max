@@ -7,6 +7,7 @@ import tempfile
 import time
 import traceback
 import unittest
+from unittest.mock import patch
 
 from olympus.preservation import Store, PreservationError
 from olympus.runtime_control import RuntimeControl
@@ -122,6 +123,62 @@ class RuntimeTests(unittest.TestCase):
             runtime.snapshot = lambda: value
             with self.assertRaises(PreservationError):
                 runtime.assert_quiet()
+
+    def test_continuous_mode_recreates_pilot_with_separate_consolidation_capacity(self):
+        runtime = RuntimeControl(Path("/tmp"))
+        current = {"running": True, "workers_stopped": False, "provider_disabled": False,
+                   "worker_slots": 1, "consolidation_reserved_slots": 0}
+        target = {**current, "worker_slots": 2, "consolidation_reserved_slots": 1}
+        observations = iter([current, target])
+        runtime.snapshot = lambda: next(observations)
+        commands = []
+        runtime._run = lambda command, **kwargs: commands.append(command)
+        self.assertEqual(runtime.set_mode("continuous"), target)
+        self.assertEqual(commands[0][-1], "continuous")
+
+    def test_runtime_does_not_claim_continuous_with_unobserved_slot_config(self):
+        runtime = RuntimeControl(Path("/tmp"))
+        runtime.snapshot = lambda: {"running": True, "workers_stopped": False, "provider_disabled": False,
+                                    "worker_slots": 1, "consolidation_reserved_slots": 0}
+        runtime._run = lambda *args, **kwargs: None
+        with self.assertRaisesRegex(PreservationError, "runtime_mode_not_observed"):
+            runtime.set_mode("continuous")
+
+    def test_separate_pause_stops_worker_without_changing_read_api_identity(self):
+        runtime = RuntimeControl(Path('/tmp'))
+        active = {'running': True, 'runtime_layout': 'separate_api_worker', 'container_id': 'api-1',
+                  'workers_stopped': False, 'provider_disabled': False, 'worker_slots': 2, 'consolidation_reserved_slots': 1}
+        quiet = {**active, 'workers_stopped': True, 'provider_disabled': True, 'worker_slots': 1, 'consolidation_reserved_slots': 0}
+        runtime.snapshot = unittest.mock.Mock(side_effect=[active, quiet])
+        calls = []
+        runtime._run = lambda command, **kwargs: calls.append(command)
+        observed = runtime.set_mode('safe')
+        self.assertEqual(observed['container_id'], 'api-1')
+        self.assertEqual(calls[0][-1], 'safe')
+
+    def test_failed_worker_shutdown_does_not_stop_read_api(self):
+        runtime = RuntimeControl(Path('/tmp'))
+        runtime.snapshot = lambda: {'running': True, 'runtime_layout': 'separate_api_worker',
+            'workers_stopped': False, 'provider_disabled': False, 'worker_slots': 2, 'consolidation_reserved_slots': 1}
+        calls = []
+        def run(command, **kwargs):
+            calls.append(command)
+            if len(calls) == 1:
+                raise PreservationError('runtime_command_failed')
+        runtime._run = run
+        with self.assertRaises(PreservationError): runtime.set_mode('safe')
+        self.assertEqual(calls[-1][-2:], ['stop', 'worker'])
+
+    def test_matching_config_with_unhealthy_worker_triggers_recovery(self):
+        runtime = RuntimeControl(Path('/tmp'))
+        bad = {'running': True, 'runtime_layout': 'separate_api_worker', 'api_ready': True,
+               'worker_ready': False, 'workers_stopped': False, 'provider_disabled': False,
+               'worker_slots': 2, 'consolidation_reserved_slots': 1}
+        runtime.snapshot = unittest.mock.Mock(side_effect=[bad, {**bad, 'worker_ready': True}])
+        calls = []
+        runtime._run = lambda command, **kwargs: calls.append(command)
+        self.assertTrue(runtime.set_mode('continuous')['worker_ready'])
+        self.assertEqual(len(calls), 1)
 
 
 if __name__ == "__main__":
